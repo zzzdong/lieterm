@@ -85,13 +85,8 @@ fn special(name: &str, ctrl: bool, shift: bool, alt: bool) -> Option<Vec<u8>> {
                 _ => 'S',
             };
             if shift || alt || ctrl {
-                return csi(
-                    "",
-                    &format!("{}~", 11 + name[1..].parse::<u8>().unwrap_or(1)),
-                    shift,
-                    alt,
-                    ctrl,
-                );
+                // xterm: F1–F4 带修饰是 CSI 1;{mod} P/Q/R/S（不能写成 11–14~）。
+                return csi("", &letter.to_string(), shift, alt, ctrl);
             }
             format!("\x1bO{letter}")
         }

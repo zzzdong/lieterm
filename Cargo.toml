@@ -7,5 +7,17 @@ edition = "2024"
 zzzui = { path = "../zzzui" }
 alacritty_terminal = "0.26.0"
 russh = "0.65.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs"] }
 anyhow = "1"
+russh-sftp = "3.0.1"
+
+# 本地 shell 试验模式（LIETERM_LOCAL）：Windows 用 ConPTY，Unix 用 pty。
+[target.'cfg(windows)'.dependencies]
+conpty = "0.7.0"
+
+[target.'cfg(unix)'.dependencies]
+portable-pty = "0.9.0"
+
+[dev-dependencies]
+# 内存 SSH 服务器测试：生成临时 Ed25519 主机/用户密钥。
+rand = "0.10"
