@@ -11,11 +11,53 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// 全部持久化配置。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub sessions: Vec<SessionProfile>,
     pub macros: Vec<Macro>,
+    /// 终端外观与编码（字体 / 配色 / 编码）。
+    pub terminal: TerminalSettings,
+}
+
+/// 终端外观与字符编码设置。
+///
+/// 字体族为空时自动探测系统等宽字体；配色与编码接受名称字符串，
+/// 未知值回退到默认（深色 / UTF-8），不会让配置加载失败。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSettings {
+    /// 字体族名；空字符串 = 自动探测。
+    pub font_family: String,
+    /// 字号（逻辑像素），限制在 8..=40。
+    pub font_size: f64,
+    /// `dark` / `light` / `solarized`。
+    pub color_scheme: String,
+    /// `utf-8` / `gbk` / `gb18030` / `big5` / `shift_jis` / `latin1`。
+    pub encoding: String,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            font_family: String::new(),
+            font_size: 14.0,
+            color_scheme: "dark".to_owned(),
+            encoding: "utf-8".to_owned(),
+        }
+    }
+}
+
+impl TerminalSettings {
+    /// 字号收敛到可用区间，避免配置写错导致终端不可见。
+    #[must_use]
+    pub fn clamped_font_size(&self) -> f64 {
+        if self.font_size.is_finite() {
+            self.font_size.clamp(8.0, 40.0)
+        } else {
+            14.0
+        }
+    }
 }
 
 /// 一个保存的连接参数（不含密码）。
@@ -237,6 +279,40 @@ mod tests {
 
         let loaded = Config::load(&path);
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn terminal_settings_default_and_partial_file() {
+        let dir = temp_dir("terminal");
+        let path = dir.join("config.json");
+
+        // 旧版配置没有 terminal 字段：应整体回退到默认值。
+        std::fs::write(&path, r#"{"sessions":[],"macros":[]}"#).expect("写文件");
+        assert_eq!(Config::load(&path).terminal, TerminalSettings::default());
+
+        std::fs::write(
+            &path,
+            r#"{"terminal":{"font_family":"Fira Code","font_size":18,"color_scheme":"solarized","encoding":"gbk"}}"#,
+        )
+        .expect("写文件");
+        let settings = Config::load(&path).terminal;
+        assert_eq!(settings.font_family, "Fira Code");
+        assert_eq!(settings.clamped_font_size(), 18.0);
+        assert_eq!(settings.color_scheme, "solarized");
+        assert_eq!(settings.encoding, "gbk");
+    }
+
+    #[test]
+    fn font_size_is_clamped_to_visible_range() {
+        let mut settings = TerminalSettings {
+            font_size: 400.0,
+            ..TerminalSettings::default()
+        };
+        assert_eq!(settings.clamped_font_size(), 40.0);
+        settings.font_size = 1.0;
+        assert_eq!(settings.clamped_font_size(), 8.0);
+        settings.font_size = f64::NAN;
+        assert_eq!(settings.clamped_font_size(), 14.0);
     }
 
     #[test]

@@ -663,7 +663,8 @@ mod tests {
                     SshEvent::SftpReady { .. }
                     | SshEvent::SftpListing { .. }
                     | SshEvent::SftpNotice(_)
-                    | SshEvent::SftpError(_),
+                    | SshEvent::SftpError(_)
+                    | SshEvent::SftpProgress { .. },
                 )))
                 | Ok(Some((_, SshEvent::Closed)))
                 | Ok(None)

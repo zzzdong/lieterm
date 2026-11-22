@@ -85,10 +85,77 @@ const MENUS: &[(&str, &[&str])] = &[
             "宏…",
         ],
     ),
+    (
+        "终端",
+        &[
+            "深色配色",
+            "浅色配色",
+            "Solarized 配色",
+            "编码 UTF-8",
+            "编码 GBK",
+            "编码 GB18030",
+        ],
+    ),
     ("帮助", &["关于"]),
 ];
 
 // 本地 shell 选项在 Root 构建时按操作系统探测（`local::available_shells`）。
+
+/// 会话页布局几何：菜单栏 / 标签栏 / 快速连接面板 / SFTP 侧栏共同决定终端视口。
+///
+/// 声明树（`Root::view`）、命中测试（`cell_at` / `in_terminal`）与光栅化
+/// （`on_frame` 的尺寸和偏移）必须共用这一份推导：任一侧漏掉侧栏宽度，
+/// 终端像素与行列坐标就会错位。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry {
+    /// 终端视口左边界（快速连接面板右侧）。
+    left: f64,
+    /// 终端视口右边界（SFTP 侧栏左侧）。
+    right: f64,
+    /// 终端视口上边界（菜单栏 + 标签栏下方）。
+    top: f64,
+    /// 终端视口下边界（状态栏上方）。
+    bottom: f64,
+}
+
+impl Geometry {
+    fn new(width: f64, height: f64, has_tabs: bool, quick_open: bool, sftp_open: bool) -> Self {
+        let width = width.max(1.0);
+        let height = height.max(1.0);
+        let tab_height = if has_tabs { TAB_BAR_HEIGHT } else { 0.0 };
+        let left = if quick_open { QUICK_WIDTH } else { 0.0 };
+        let right = (width - if sftp_open { SIDEBAR_WIDTH } else { 0.0 }).max(left + 1.0);
+        let top = MENUBAR_HEIGHT + tab_height;
+        let bottom = (height - STATUS_HEIGHT).max(top + 1.0);
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+
+    fn width(self) -> f64 {
+        (self.right - self.left).max(1.0)
+    }
+
+    fn height(self) -> f64 {
+        (self.bottom - self.top).max(1.0)
+    }
+
+    fn contains(self, x: f64, y: f64) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    /// 终端列数：右侧留 8 逻辑像素余量，避免最后半列被裁。
+    fn cols(self, cell_width: f64) -> usize {
+        ((self.width() - 8.0) / cell_width).floor().max(1.0) as usize
+    }
+
+    fn rows(self, cell_height: f64) -> usize {
+        (self.height() / cell_height).floor().max(1.0) as usize
+    }
+}
 
 zzzui::key_enum! {
     enum Act {
@@ -112,6 +179,7 @@ zzzui::key_enum! {
         SftpEnter,
         SftpUpload,
         SftpDownload,
+        SftpCancel,
         SftpClose,
         SessionName,
         SessionConnect,
@@ -171,6 +239,12 @@ pub enum SshEvent {
     /// SFTP 操作提示 / 错误（不切换主会话状态）。
     SftpNotice(String),
     SftpError(String),
+    /// 大文件传输进度；`active == false` 表示本次传输结束（成功 / 取消 / 失败）。
+    SftpProgress {
+        done: u64,
+        total: u64,
+        active: bool,
+    },
 }
 
 pub enum UiAction {
@@ -226,6 +300,10 @@ pub enum UiAction {
     },
     /// 取消远端 rz 上传并通知对端。
     UploadCancel,
+    /// 切换终端配色（立即应用到所有标签）。
+    SetScheme(String),
+    /// 切换终端编码（现有标签重置解码器，新标签沿用）。
+    SetEncoding(String),
 }
 
 /// 远端目录项（UI 与 SFTP 任务之间的值类型）。
@@ -246,6 +324,16 @@ pub struct SftpState {
     /// 上传源文件 / 下载目标文件。
     pub local_path: String,
     pub notice: String,
+    /// 正在进行的传输进度（None = 空闲）。
+    pub progress: Option<TransferProgress>,
+}
+
+/// 一次 SFTP 传输的字节进度。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub done: u64,
+    /// 总大小；远端/本地取不到时为 0（UI 只显示已传字节）。
+    pub total: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -431,21 +519,27 @@ impl Widget for Root {
         };
 
         if shared.screen == Screen::Session {
-            let area = (height - MENUBAR_HEIGHT - tab_height - STATUS_HEIGHT).max(1.0);
-            let quick_width = if shared.quick_open { QUICK_WIDTH } else { 0.0 };
-            let sftp_width = if shared.sftp.open { SIDEBAR_WIDTH } else { 0.0 };
-            let capture_width = (width - quick_width - sftp_width).max(1.0);
+            let geom = Geometry::new(
+                width,
+                height,
+                !shared.tabs.is_empty(),
+                shared.quick_open,
+                shared.sftp.open,
+            );
             let terminal = KeyCapture::new()
-                .size(capture_width, area)
+                .size(geom.width(), geom.height())
                 .ime(shared.ime)
                 .view(theme);
-            let body_width = (width - quick_width).max(1.0);
+            let body_width = (width - geom.left).max(1.0);
             let mut body = if shared.sftp.open {
                 Row::new()
                     .width(body_width)
-                    .height(area)
+                    .height(geom.height())
                     .view(theme)
-                    .with_children([self.sftp_sidebar_view(theme, area, &shared.sftp), terminal])
+                    .with_children([
+                        self.sftp_sidebar_view(theme, geom.height(), &shared.sftp),
+                        terminal,
+                    ])
             } else {
                 terminal
             };
@@ -453,9 +547,9 @@ impl Widget for Root {
             if shared.quick_open {
                 body = Row::new()
                     .width(width)
-                    .height(area)
+                    .height(geom.height())
                     .view(theme)
-                    .with_children([self.quick_connect_view(theme, area), body]);
+                    .with_children([self.quick_connect_view(theme, geom.height()), body]);
             }
             let mut children = vec![menubar];
             children.extend(tab_bar);
@@ -1186,10 +1280,17 @@ impl Root {
                     }));
                 return true;
             }
+            Some(Act::SftpCancel) => {
+                let _ = self
+                    .actions
+                    .send(UiAction::SftpAction(sftp::SftpAction::Cancel));
+                return true;
+            }
             Some(Act::SftpClose) => {
                 if let Ok(mut shared) = self.shared.lock() {
                     shared.sftp.open = false;
                     shared.sftp.notice.clear();
+                    shared.sftp.progress = None;
                 }
                 let _ = self.actions.send(UiAction::SftpClose);
                 ctx.mark_dirty();
@@ -1773,11 +1874,32 @@ impl Root {
                 .with_key(Act::SftpLocal)
                 .view(theme),
         );
-        children.push(Row::new().gap(6.0).view(theme).with_children([
+        if let Some(progress) = &sftp.progress {
+            let text = if progress.total > 0 {
+                format!(
+                    "传输中 {} / {}",
+                    format_bytes(progress.done),
+                    format_bytes(progress.total)
+                )
+            } else {
+                format!("传输中 {}", format_bytes(progress.done))
+            };
+            children.push(
+                Label::new(text)
+                    .size(12.0)
+                    .color(theme.text(TextToken::Secondary))
+                    .view(theme),
+            );
+        }
+        let mut buttons = vec![
             Button::new("上传").with_key(Act::SftpUpload).view(theme),
             Button::new("下载").with_key(Act::SftpDownload).view(theme),
-            Button::new("关闭").with_key(Act::SftpClose).view(theme),
-        ]));
+        ];
+        if sftp.progress.is_some() {
+            buttons.push(Button::new("取消").with_key(Act::SftpCancel).view(theme));
+        }
+        buttons.push(Button::new("关闭").with_key(Act::SftpClose).view(theme));
+        children.push(Row::new().gap(6.0).view(theme).with_children(buttons));
         if !sftp.notice.is_empty() {
             children.push(
                 Label::new(sftp.notice.clone())
@@ -2063,8 +2185,34 @@ impl Root {
                 ctx.mark_dirty();
             }
             // 帮助 > 关于
-            (2, 0) => {
+            (3, 0) => {
                 self.set_label("lieterm 0.1 · zzzui 终端试作");
+                ctx.mark_dirty();
+            }
+            // 终端 > 配色（深色 / 浅色 / Solarized）
+            (2, 0..=2) => {
+                let scheme = ["dark", "light", "solarized"][item];
+                self.config.terminal.color_scheme = scheme.to_owned();
+                self.set_label(
+                    self.save_config()
+                        .err()
+                        .unwrap_or_else(|| format!("已切换配色：{scheme}")),
+                );
+                let _ = self.actions.send(UiAction::SetScheme(scheme.to_owned()));
+                ctx.mark_dirty();
+            }
+            // 终端 > 编码（UTF-8 / GBK / GB18030）
+            (2, 3..=5) => {
+                let encoding = ["utf-8", "gbk", "gb18030"][item - 3];
+                self.config.terminal.encoding = encoding.to_owned();
+                self.set_label(
+                    self.save_config()
+                        .err()
+                        .unwrap_or_else(|| format!("已切换编码：{encoding}")),
+                );
+                let _ = self
+                    .actions
+                    .send(UiAction::SetEncoding(encoding.to_owned()));
                 ctx.mark_dirty();
             }
             // 会话 > 已保存会话…
@@ -2513,7 +2661,7 @@ impl Root {
             .build(owner, theme)
     }
 
-    /// 指针是否落在终端查看区（排除菜单栏、标签栏、状态栏与 SFTP 侧边栏）。
+    /// 指针是否落在终端查看区（排除菜单栏、标签栏、状态栏与两侧侧栏）。
     fn in_terminal(&self, x: f64, y: f64) -> bool {
         let Ok(shared) = self.shared.lock() else {
             return false;
@@ -2521,15 +2669,14 @@ impl Root {
         if shared.screen != Screen::Session {
             return false;
         }
-        let top = MENUBAR_HEIGHT
-            + if shared.tabs.is_empty() {
-                0.0
-            } else {
-                TAB_BAR_HEIGHT
-            };
-        let right = shared.width - if shared.sftp.open { SIDEBAR_WIDTH } else { 0.0 };
-        let left = if shared.quick_open { QUICK_WIDTH } else { 0.0 };
-        y >= top && y < shared.height - STATUS_HEIGHT && x >= left && x < right
+        Geometry::new(
+            shared.width,
+            shared.height,
+            !shared.tabs.is_empty(),
+            shared.quick_open,
+            shared.sftp.open,
+        )
+        .contains(x, y)
     }
 }
 
@@ -2567,6 +2714,22 @@ fn session_entry_key(owner: NodeKey, index: usize) -> NodeKey {
 /// 宏管理列表第 `index` 行的声明 key。
 fn macro_entry_key(owner: NodeKey, index: usize) -> NodeKey {
     child_key(owner, MACRO_ENTRY_BASE + index as LocalKey)
+}
+
+/// 字节数 → 便于阅读的尺寸（用于 SFTP 传输进度）。
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// 下载时给一个可用的本地默认路径。
@@ -2782,9 +2945,10 @@ pub struct LietermApp {
     /// 活动标签（`None` 表示还没有会话）。
     active: Option<TabId>,
     next_tab_id: TabId,
-    /// 新建标签用的字体参数（与启动终端一致）。
-    family: String,
+    /// 新建标签用的终端样式（字体 / 配色 / 编码，与启动终端一致）。
+    style: term::TermStyle,
     cell_width: f64,
+    cell_height: f64,
     last_viewport: (f64, f64),
     focus_pending: bool,
     /// 远程标题同步（只在变化时调 `set_title`）。
@@ -2824,8 +2988,9 @@ impl LietermApp {
             tabs: Vec::new(),
             active: None,
             next_tab_id: 1,
-            family: terminal.family().to_owned(),
+            style: terminal.style(),
             cell_width: terminal.cell_width(),
+            cell_height: terminal.cell_height(),
             last_viewport: (0.0, 0.0),
             focus_pending: false,
             last_title: String::new(),
@@ -2868,7 +3033,7 @@ impl LietermApp {
             .unwrap_or((80, 24));
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let mut terminal = Terminal::new(cols, rows, self.family.clone(), self.cell_width);
+        let mut terminal = Terminal::new(cols, rows, self.style.clone());
         terminal.set_cursor_visible(self.cursor_visible);
         self.tabs.push(Tab {
             id,
@@ -3126,29 +3291,21 @@ impl LietermApp {
         if tab.screen != Screen::Session {
             return None;
         }
-        let (width, height, sftp_open, quick_open) = {
+        let geom = {
             let shared = self.shared.lock().ok()?;
-            (
+            Geometry::new(
                 shared.width,
                 shared.height,
-                shared.sftp.open,
+                !shared.tabs.is_empty(),
                 shared.quick_open,
+                shared.sftp.open,
             )
         };
-        let top = MENUBAR_HEIGHT
-            + if self.tabs.is_empty() {
-                0.0
-            } else {
-                TAB_BAR_HEIGHT
-            };
-        let right = width - if sftp_open { SIDEBAR_WIDTH } else { 0.0 };
-        let left = if quick_open { QUICK_WIDTH } else { 0.0 };
-        let bottom = height - STATUS_HEIGHT;
-        if !clamp && (x < left || x >= right || y < top || y >= bottom) {
+        if !clamp && !geom.contains(x, y) {
             return None;
         }
-        let col = ((x - left) / self.cell_width).floor();
-        let row = ((y - top) / term::CELL_HEIGHT).floor();
+        let col = ((x - geom.left) / self.cell_width).floor();
+        let row = ((y - geom.top) / self.cell_height).floor();
         let max_col = tab.terminal.cols().saturating_sub(1) as f64;
         let max_row = tab.terminal.rows().saturating_sub(1) as f64;
         Some((
@@ -3249,6 +3406,22 @@ impl AppHandler for LietermApp {
                     }
                     dirty = true;
                 }
+                UiAction::SetScheme(name) => {
+                    let theme = term::TermTheme::from_name(&name);
+                    self.style.theme = theme.clone();
+                    for tab in &mut self.tabs {
+                        tab.terminal.set_theme(theme.clone());
+                    }
+                    dirty = true;
+                }
+                UiAction::SetEncoding(name) => {
+                    let encoding = term::TextEncoding::from_name(&name);
+                    self.style.encoding = encoding;
+                    for tab in &mut self.tabs {
+                        tab.terminal.set_encoding(encoding);
+                    }
+                    dirty = true;
+                }
                 UiAction::Disconnect => {
                     self.disconnect();
                     dirty = true;
@@ -3258,7 +3431,7 @@ impl AppHandler for LietermApp {
                     return;
                 }
                 UiAction::Scroll(delta) => {
-                    let lines = (-(delta / term::CELL_HEIGHT)).round() as i32;
+                    let lines = (-(delta / self.cell_height)).round() as i32;
                     if lines != 0
                         && let Some(tab) = self.active_tab_mut()
                     {
@@ -3435,6 +3608,18 @@ impl AppHandler for LietermApp {
                 SshEvent::SftpError(message) => {
                     if let Some(tab) = self.tab_mut(id) {
                         tab.sftp.notice = format!("错误：{message}");
+                        tab.sftp.progress = None;
+                    }
+                    self.push_active_sftp(id);
+                    dirty = true;
+                }
+                SshEvent::SftpProgress {
+                    done,
+                    total,
+                    active,
+                } => {
+                    if let Some(tab) = self.tab_mut(id) {
+                        tab.sftp.progress = active.then_some(TransferProgress { done, total });
                     }
                     self.push_active_sftp(id);
                     dirty = true;
@@ -3472,24 +3657,20 @@ impl AppHandler for LietermApp {
 
         let viewport = ctx.runtime.viewport();
         let scale = ctx.runtime.scale();
-        let sftp_inset = if self.active_tab().is_some_and(|tab| tab.sftp.open) {
-            SIDEBAR_WIDTH
-        } else {
-            0.0
-        };
-        let tab_inset = if self.tabs.is_empty() {
-            0.0
-        } else {
-            TAB_BAR_HEIGHT
-        };
-        let term_width = (viewport.width - sftp_inset).max(1.0);
-        let term_height = (viewport.height - MENUBAR_HEIGHT - tab_inset - STATUS_HEIGHT).max(1.0);
+        let quick_open = self.shared.lock().is_ok_and(|shared| shared.quick_open);
+        let geom = Geometry::new(
+            viewport.width,
+            viewport.height,
+            !self.tabs.is_empty(),
+            quick_open,
+            self.active_tab().is_some_and(|tab| tab.sftp.open),
+        );
+        let term_width = geom.width();
+        let term_height = geom.height();
         if (term_width, term_height) != self.last_viewport {
             self.last_viewport = (term_width, term_height);
-            let cols = ((term_width - 8.0) / self.cell_width).floor() as usize;
-            let cols = cols.clamp(20, 400);
-            let rows = (term_height / term::CELL_HEIGHT).floor() as usize;
-            let rows = rows.clamp(6, 200);
+            let cols = geom.cols(self.cell_width).clamp(20, 400);
+            let rows = geom.rows(self.cell_height).clamp(6, 200);
             let px_width = (term_width * scale).round().max(1.0) as u32;
             let px_height = (term_height * scale).round().max(1.0) as u32;
             // 所有标签一起 resize：切换过去时行列已经正确。
@@ -3516,12 +3697,12 @@ impl AppHandler for LietermApp {
         if dirty {
             let px_width = ctx.runtime.frame().width();
             let px_height = ctx.runtime.frame().height();
-            let top_inset = (MENUBAR_HEIGHT + tab_inset) * scale;
+            let top_inset = geom.top * scale;
             let render_start = Instant::now();
             // 只光栅化活动标签；后台标签保留自己的终端状态，切回来再画。
             let image = if let Some(tab) = self.active_tab_mut() {
                 tab.terminal
-                    .render(px_width, px_height, scale, top_inset, sftp_inset * scale);
+                    .render(px_width, px_height, scale, top_inset, geom.left * scale);
                 tab.terminal.image()
             } else {
                 None

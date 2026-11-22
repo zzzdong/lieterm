@@ -193,9 +193,9 @@ fn dialog_is_modal_and_offers_local_and_ssh_tabs() {
 }
 
 #[test]
-fn menu_bar_declares_the_three_menus() {
+fn menu_bar_declares_terminal_and_help_menus() {
     let view = root_with(Screen::Idle, "", false).view(&UiTheme::default());
-    for label in ["文件", "会话", "帮助"] {
+    for label in ["文件", "会话", "终端", "帮助"] {
         assert!(has_text(&view, label), "菜单栏缺少 {label}");
     }
 }
@@ -275,4 +275,51 @@ fn macro_manager_lists_macros_and_enter_state() {
     for label in ["宏", "磁盘", "df -h", "自动回车：开", "运行"] {
         assert!(has_text(&overlays[0].content, label), "宏管理缺少 {label}");
     }
+}
+
+#[test]
+fn geometry_accounts_for_both_sidebars() {
+    let geom = Geometry::new(1200.0, 800.0, true, true, true);
+    assert_eq!(geom.left, QUICK_WIDTH, "快速连接面板应把终端右推");
+    assert_eq!(geom.right, 1200.0 - SIDEBAR_WIDTH, "SFTP 侧栏应把终端左收");
+    assert_eq!(geom.top, MENUBAR_HEIGHT + TAB_BAR_HEIGHT);
+    assert_eq!(geom.bottom, 800.0 - STATUS_HEIGHT);
+    assert_eq!(geom.width(), 1200.0 - QUICK_WIDTH - SIDEBAR_WIDTH);
+    assert_eq!(
+        geom.height(),
+        800.0 - MENUBAR_HEIGHT - TAB_BAR_HEIGHT - STATUS_HEIGHT
+    );
+}
+
+#[test]
+fn geometry_cols_follow_the_terminal_capture_width() {
+    let cell_width = 9.0;
+    let both = Geometry::new(1200.0, 800.0, true, true, true);
+    let no_quick = Geometry::new(1200.0, 800.0, true, false, true);
+    let expected = |geom: Geometry| ((geom.width() - 8.0) / cell_width).floor() as usize;
+    assert_eq!(both.cols(cell_width), expected(both));
+    assert_eq!(
+        both.rows(term::CELL_HEIGHT),
+        (both.height() / term::CELL_HEIGHT).floor() as usize
+    );
+    assert!(
+        both.cols(cell_width) < no_quick.cols(cell_width),
+        "快速连接面板打开后列数必须减少，否则终端会画出视口"
+    );
+}
+
+#[test]
+fn geometry_hittest_excludes_the_sidebars() {
+    let geom = Geometry::new(1200.0, 800.0, true, true, true);
+    let y = geom.top + 1.0;
+    assert!(
+        !geom.contains(QUICK_WIDTH - 1.0, y),
+        "快速连接面板不属于终端"
+    );
+    assert!(geom.contains(QUICK_WIDTH + 1.0, y), "面板右侧应是终端");
+    assert!(!geom.contains(geom.right + 1.0, y), "SFTP 侧栏不属于终端");
+    assert!(
+        !geom.contains(QUICK_WIDTH + 1.0, geom.bottom + 1.0),
+        "状态栏不属于终端"
+    );
 }

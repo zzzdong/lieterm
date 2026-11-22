@@ -18,9 +18,30 @@ use crate::{
 #[derive(Debug)]
 pub enum SftpAction {
     List(String),
-    Download { remote: String, local: String },
-    Upload { local: String, remote: String },
+    Download {
+        remote: String,
+        local: String,
+    },
+    Upload {
+        local: String,
+        remote: String,
+    },
+    /// 取消正在进行的传输（空闲时忽略）。
+    Cancel,
     Close,
+}
+
+/// 一次文件传输的分块大小：大文件不再整读进内存。
+const CHUNK_SIZE: usize = 64 * 1024;
+/// 进度事件的节流阈值（每传这么多字节上报一次）。
+const PROGRESS_STEP: u64 = 512 * 1024;
+
+/// 传输结果：完成 / 用户取消 / 侧栏关闭。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Done { bytes: u64 },
+    Cancelled,
+    Closed,
 }
 
 pub fn spawn(
@@ -72,61 +93,83 @@ async fn run(
                     bridge.notify(SshEvent::SftpError(format!("列目录 {path} 失败：{err}")))
                 }
             },
-            SftpAction::Download { remote, local } => match sftp.read(&remote).await {
-                Ok(bytes) => {
-                    if let Err(err) = tokio::fs::write(&local, &bytes).await {
-                        bridge.notify(SshEvent::SftpError(format!(
-                            "写入本地文件 {local} 失败：{err}"
+            SftpAction::Download { remote, local } => {
+                match download(&sftp, &remote, &local, &mut actions, bridge).await {
+                    Ok(Outcome::Done { bytes }) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: bytes,
+                            total: bytes,
+                            active: false,
+                        });
+                        bridge.notify(SshEvent::SftpNotice(format!(
+                            "已下载 {remote} → {local}（{bytes} 字节）"
                         )));
-                        continue;
                     }
-                    bridge.notify(SshEvent::SftpNotice(format!(
-                        "已下载 {} → {}（{} 字节）",
-                        remote,
-                        local,
-                        bytes.len()
-                    )));
+                    Ok(Outcome::Cancelled) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: 0,
+                            total: 0,
+                            active: false,
+                        });
+                        bridge.notify(SshEvent::SftpNotice(format!("已取消下载 {remote}")));
+                    }
+                    Ok(Outcome::Closed) => break,
+                    Err(err) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: 0,
+                            total: 0,
+                            active: false,
+                        });
+                        bridge.notify(SshEvent::SftpError(format!("下载 {remote} 失败：{err:#}")));
+                    }
                 }
-                Err(err) => {
-                    bridge.notify(SshEvent::SftpError(format!("下载 {remote} 失败：{err}")));
-                }
-            },
-            SftpAction::Upload { local, remote } => match tokio::fs::read(&local).await {
-                Ok(bytes) => {
-                    // `SftpSession::write` 只带 WRITE 标志：远端文件不存在会失败，
-                    // 已存在时会保留旧文件尾部。create() 用 CREATE|TRUNCATE|WRITE。
-                    match upload(&sftp, &remote, &bytes).await {
-                        Ok(()) => {
-                            let parent = parent_path(&remote);
-                            let notice =
-                                format!("已上传 {} → {}（{} 字节）", local, remote, bytes.len());
-                            match list(&sftp, &parent).await {
-                                Ok(entries) => {
-                                    bridge.notify(SshEvent::SftpNotice(notice));
-                                    bridge.notify(SshEvent::SftpListing {
-                                        path: parent,
-                                        entries,
-                                    });
-                                }
-                                Err(err) => {
-                                    bridge.notify(SshEvent::SftpError(format!(
-                                        "刷新目录失败：{err}"
-                                    )));
-                                }
+            }
+            SftpAction::Upload { local, remote } => {
+                // `SftpSession::write` 只带 WRITE 标志：远端文件不存在会失败，
+                // 已存在时会保留旧文件尾部。create() 用 CREATE|TRUNCATE|WRITE。
+                match upload(&sftp, &local, &remote, &mut actions, bridge).await {
+                    Ok(Outcome::Done { bytes }) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: bytes,
+                            total: bytes,
+                            active: false,
+                        });
+                        let parent = parent_path(&remote);
+                        let notice = format!("已上传 {local} → {remote}（{bytes} 字节）");
+                        match list(&sftp, &parent).await {
+                            Ok(entries) => {
+                                bridge.notify(SshEvent::SftpNotice(notice));
+                                bridge.notify(SshEvent::SftpListing {
+                                    path: parent,
+                                    entries,
+                                });
+                            }
+                            Err(err) => {
+                                bridge.notify(SshEvent::SftpError(format!("刷新目录失败：{err}")));
                             }
                         }
-                        Err(err) => {
-                            bridge
-                                .notify(SshEvent::SftpError(format!("上传 {remote} 失败：{err}")));
-                        }
+                    }
+                    Ok(Outcome::Cancelled) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: 0,
+                            total: 0,
+                            active: false,
+                        });
+                        bridge.notify(SshEvent::SftpNotice(format!("已取消上传 {remote}")));
+                    }
+                    Ok(Outcome::Closed) => break,
+                    Err(err) => {
+                        bridge.notify(SshEvent::SftpProgress {
+                            done: 0,
+                            total: 0,
+                            active: false,
+                        });
+                        bridge.notify(SshEvent::SftpError(format!("上传 {remote} 失败：{err:#}")));
                     }
                 }
-                Err(err) => {
-                    bridge.notify(SshEvent::SftpError(format!(
-                        "读取本地文件 {local} 失败：{err}"
-                    )));
-                }
-            },
+            }
+            // 空闲时收到取消 / 关闭：关闭请求结束任务，取消无需处理。
+            SftpAction::Cancel => {}
             SftpAction::Close => break,
         }
     }
@@ -138,22 +181,155 @@ async fn run(
     Ok(())
 }
 
-/// 覆盖写入远端文件：不存在则创建，存在则截断。
-async fn upload(sftp: &SftpSession, remote: &str, bytes: &[u8]) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
+/// 传输期间检查取消 / 关闭；其它请求直接丢弃，避免与传输交错。
+fn interrupted(actions: &mut UnboundedReceiver<SftpAction>) -> Option<Outcome> {
+    while let Ok(action) = actions.try_recv() {
+        match action {
+            SftpAction::Cancel => return Some(Outcome::Cancelled),
+            SftpAction::Close => return Some(Outcome::Closed),
+            _ => {}
+        }
+    }
+    None
+}
 
-    let mut file = sftp
+/// 分块下载：远端读到本地，边传边上报进度。
+async fn download(
+    sftp: &SftpSession,
+    remote: &str,
+    local: &str,
+    actions: &mut UnboundedReceiver<SftpAction>,
+    bridge: &Bridge,
+) -> Result<Outcome> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut source = sftp
+        .open(remote)
+        .await
+        .with_context(|| format!("打开远端文件 {remote}"))?;
+    let total = source.metadata().await.map(|meta| meta.len()).unwrap_or(0);
+    let mut target = tokio::fs::File::create(local)
+        .await
+        .with_context(|| format!("创建本地文件 {local}"))?;
+    bridge.notify(SshEvent::SftpProgress {
+        done: 0,
+        total,
+        active: true,
+    });
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut done = 0u64;
+    let mut reported = 0u64;
+    let outcome = loop {
+        if let Some(outcome) = interrupted(actions) {
+            break outcome;
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("读取远端文件 {remote}"))?;
+        if read == 0 {
+            break Outcome::Done { bytes: done };
+        }
+        target
+            .write_all(&buffer[..read])
+            .await
+            .with_context(|| format!("写入本地文件 {local}"))?;
+        done += read as u64;
+        if done - reported >= PROGRESS_STEP {
+            reported = done;
+            bridge.notify(SshEvent::SftpProgress {
+                done,
+                total,
+                active: true,
+            });
+        }
+    };
+
+    match outcome {
+        Outcome::Done { .. } => {
+            target
+                .flush()
+                .await
+                .with_context(|| format!("刷新本地文件 {local}"))?;
+        }
+        Outcome::Cancelled | Outcome::Closed => {
+            let _ = target.flush().await;
+            drop(target);
+            // 半截文件会误导用户，取消后直接删掉。
+            let _ = tokio::fs::remove_file(local).await;
+        }
+    }
+    Ok(outcome)
+}
+
+/// 分块上传：本地读到远端（create 会截断旧文件），边传边上报进度。
+async fn upload(
+    sftp: &SftpSession,
+    local: &str,
+    remote: &str,
+    actions: &mut UnboundedReceiver<SftpAction>,
+    bridge: &Bridge,
+) -> Result<Outcome> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut source = tokio::fs::File::open(local)
+        .await
+        .with_context(|| format!("打开本地文件 {local}"))?;
+    let total = source.metadata().await.map(|meta| meta.len()).unwrap_or(0);
+    let mut target = sftp
         .create(remote)
         .await
         .with_context(|| format!("打开远端文件 {remote}"))?;
-    if let Err(err) = file.write_all(bytes).await {
-        let _ = file.close().await;
-        return Err(err).with_context(|| format!("写入远端文件 {remote}"));
+    bridge.notify(SshEvent::SftpProgress {
+        done: 0,
+        total,
+        active: true,
+    });
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut done = 0u64;
+    let mut reported = 0u64;
+    let outcome = loop {
+        if let Some(outcome) = interrupted(actions) {
+            break outcome;
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("读取本地文件 {local}"))?;
+        if read == 0 {
+            break Outcome::Done { bytes: done };
+        }
+        target
+            .write_all(&buffer[..read])
+            .await
+            .with_context(|| format!("写入远端文件 {remote}"))?;
+        done += read as u64;
+        if done - reported >= PROGRESS_STEP {
+            reported = done;
+            bridge.notify(SshEvent::SftpProgress {
+                done,
+                total,
+                active: true,
+            });
+        }
+    };
+
+    match outcome {
+        Outcome::Done { .. } => {
+            target
+                .close()
+                .await
+                .with_context(|| format!("关闭远端文件 {remote}"))?;
+        }
+        Outcome::Cancelled | Outcome::Closed => {
+            drop(target);
+            // 取消后删除远端半截文件。
+            let _ = sftp.remove_file(remote).await;
+        }
     }
-    file.close()
-        .await
-        .with_context(|| format!("关闭远端文件 {remote}"))?;
-    Ok(())
+    Ok(outcome)
 }
 
 async fn list(sftp: &SftpSession, path: &str) -> Result<Vec<SftpEntry>> {

@@ -19,6 +19,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rz/sz：ZMODEM 协议状态机（MIT/Apache-2.0，无 I/O，由调用方驱动）。
 zmodem2 = "0.7.3"
+# 非 UTF-8 远程输出（GBK / Big5 / Shift_JIS）的流式解码。
+encoding_rs = "0.8"
 
 # 本地 shell 试验模式（LIETERM_LOCAL）：Windows 用 ConPTY，Unix 用 pty。
 [target.'cfg(windows)'.dependencies]
