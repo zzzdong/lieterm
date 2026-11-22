@@ -74,15 +74,16 @@ pub fn resolve_from(text: &str, alias: &str) -> Resolved {
     out
 }
 
-/// `Host` 行匹配：支持通配与 `!` 否定。
+/// `Host` 行匹配：支持通配与 `!` 否定；主机名匹配不区分大小写（与 OpenSSH 一致）。
 fn host_matches(patterns: &[&str], alias: &str) -> bool {
+    let alias = alias.to_ascii_lowercase();
     let mut positive = false;
     for pattern in patterns {
         if let Some(negated) = pattern.strip_prefix('!') {
-            if wildcard_match(negated, alias) {
+            if wildcard_match(&negated.to_ascii_lowercase(), &alias) {
                 return false;
             }
-        } else if wildcard_match(pattern, alias) {
+        } else if wildcard_match(&pattern.to_ascii_lowercase(), &alias) {
             positive = true;
         }
     }
@@ -186,5 +187,11 @@ Host *
         assert!(!wildcard_match("h?st", "hoost"));
         assert!(wildcard_match("*", "anything"));
         assert!(wildcard_match("a*b*c", "aXXbYYc"));
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        let resolved = resolve_from("Host PROD\n    User deploy\n", "Prod");
+        assert_eq!(resolved.user.as_deref(), Some("deploy"));
     }
 }

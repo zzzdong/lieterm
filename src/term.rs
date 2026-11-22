@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    term::{Config as TermConfig, Term, cell::Flags},
+    index::{Column, Point as TermPoint, Side},
+    selection::{Selection, SelectionRange, SelectionType},
+    term::{Config as TermConfig, Term, TermMode, cell::Flags, viewport_to_point},
     vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb},
 };
 use zzzui::{
@@ -29,6 +31,8 @@ pub const STATUS_HEIGHT: f64 = 26.0;
 
 const DEFAULT_BG: [u8; 3] = [0x1c, 0x1c, 0x1c];
 const DEFAULT_FG: [u8; 3] = [0xcc, 0xcc, 0xcc];
+/// 文本选择高亮底色。
+const SELECTION_BG: [u8; 3] = [0x26, 0x4f, 0x78];
 
 #[derive(Clone, Copy)]
 struct CellView {
@@ -74,24 +78,66 @@ pub fn init_font() -> (String, f64) {
     (family, cell_width)
 }
 
-/// 终端事件监听：当前只关心远程设置的标题（OSC 0 / 2）。
+/// 终端事件监听：远程标题（OSC 0 / 2）与需要回写 PTY 的查询响应。
+///
+/// fish / vim 等程序启动时会发 Primary Device Attribute（DA1）、光标位置、
+/// 颜色查询；alacritty_terminal 把应答文本通过 `Event::PtyWrite` /
+/// `Event::ColorRequest` 交出来，宿主必须写回 PTY，否则 fish 会等到超时并告警。
 #[derive(Clone, Default)]
-struct TitleListener {
+struct TermListener {
     title: Arc<Mutex<Option<String>>>,
+    responses: Arc<Mutex<Vec<u8>>>,
 }
 
-impl EventListener for TitleListener {
-    fn send_event(&self, event: Event) {
-        if let Event::Title(title) = event
-            && let Ok(mut slot) = self.title.lock()
-        {
-            *slot = Some(title);
+impl TermListener {
+    fn push_response(&self, bytes: &[u8]) {
+        if let Ok(mut slot) = self.responses.lock() {
+            slot.extend_from_slice(bytes);
         }
     }
 }
 
+impl EventListener for TermListener {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::Title(title) => {
+                if let Ok(mut slot) = self.title.lock() {
+                    *slot = Some(title);
+                }
+            }
+            Event::PtyWrite(text) => self.push_response(text.as_bytes()),
+            Event::ColorRequest(index, formatter) => {
+                let text = formatter(query_color(index));
+                self.push_response(text.as_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 把 OSC 颜色查询的 `NamedColor` 序号换算成当前调色板里的具体颜色。
+fn query_color(index: usize) -> Rgb {
+    let rgb = match index {
+        // Foreground / Cursor / BrightForeground。
+        256 | 258 | 267 => DEFAULT_FG,
+        // Background。
+        257 => DEFAULT_BG,
+        // DimBlack..=DimWhite 对应普通 0..=7。
+        259..=266 => PALETTE[index - 259],
+        // DimForeground。
+        268 => [0x80, 0x80, 0x80],
+        // 16..=255 是索引色；0..=15 是基础调色板。
+        _ => indexed_color(index as u8),
+    };
+    Rgb {
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+    }
+}
+
 pub struct Terminal {
-    term: Term<TitleListener>,
+    term: Term<TermListener>,
     parser: Processor,
     renderer: VelloPixmapRenderer,
     family: String,
@@ -100,19 +146,25 @@ pub struct Terminal {
     rows: usize,
     image: Option<ImageData>,
     title: Arc<Mutex<Option<String>>>,
+    responses: Arc<Mutex<Vec<u8>>>,
     cursor_visible: bool,
     received: usize,
+    /// 选择起点（网格坐标）。alacritty 在排序锚点时会连同 `Side` 一起交换，
+    /// 反向拖动会导致两端各缩一格；这里记住起点，每次更新都按方向重建选择。
+    selection_anchor: Option<TermPoint>,
 }
 
 impl Terminal {
     pub fn new(cols: usize, rows: usize, family: String, cell_width: f64) -> Self {
         let size = TermSize { cols, rows };
         let title = Arc::new(Mutex::new(None));
+        let responses = Arc::new(Mutex::new(Vec::new()));
         let term = Term::new(
             TermConfig::default(),
             &size,
-            TitleListener {
+            TermListener {
                 title: Arc::clone(&title),
+                responses: Arc::clone(&responses),
             },
         );
         Self {
@@ -129,8 +181,10 @@ impl Terminal {
             rows,
             image: None,
             title,
+            responses,
             cursor_visible: true,
             received: 0,
+            selection_anchor: None,
         }
     }
 
@@ -144,6 +198,11 @@ impl Terminal {
 
     pub fn cell_width(&self) -> f64 {
         self.cell_width
+    }
+
+    /// 等宽字体族（新建标签的终端需要同一套字体参数）。
+    pub fn family(&self) -> &str {
+        &self.family
     }
 
     /// 远程标题（OSC 0/2）；没有设置过时回退到 `lieterm`。
@@ -167,6 +226,84 @@ impl Terminal {
     pub fn advance(&mut self, bytes: &[u8]) {
         self.received += bytes.len();
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// 取走终端查询（DA1 / DSR / 颜色）待回写 PTY 的响应字节。
+    pub fn take_responses(&self) -> Vec<u8> {
+        self.responses
+            .lock()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    }
+
+    /// 按查看区行 / 列开始一次选择（行列都相对当前视口，含回滚偏移）。
+    pub fn start_selection(&mut self, row: usize, col: usize) {
+        let point = self.viewport_point(row, col);
+        self.selection_anchor = Some(point);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// 拖动中更新选择终点。
+    ///
+    /// 重新构造选择而不是只调 `update`：`to_range` 在起点晚于终点时会交换两个
+    /// 锚点（`Side` 跟着锚点走），反向拖动会把按下格与当前格都排除掉。
+    pub fn update_selection(&mut self, row: usize, col: usize) {
+        let point = self.viewport_point(row, col);
+        let Some(anchor) = self.selection_anchor else {
+            return;
+        };
+        let (start, end) = if point < anchor {
+            (point, anchor)
+        } else {
+            (anchor, point)
+        };
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+    }
+
+    /// 选中当前可见区域的全部行。
+    pub fn select_all(&mut self) {
+        self.selection_anchor = None;
+        let offset = self.term.grid().display_offset();
+        let rows = self.term.grid().screen_lines().max(1);
+        let start = viewport_to_point(offset, TermPoint::new(0, Column(0)));
+        let end = viewport_to_point(offset, TermPoint::new(rows - 1, Column(0)));
+        let mut selection = Selection::new(SelectionType::Lines, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.term.selection = None;
+    }
+
+    /// 当前选中的文本；没有选择或选择为空时返回 `None`。
+    pub fn selection_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
+    /// 把粘贴文本编码成 PTY 字节（应用开启了 bracketed paste 时加保护序列）。
+    pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
+        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            bytes
+        } else {
+            text.as_bytes().to_vec()
+        }
+    }
+
+    fn viewport_point(&self, row: usize, col: usize) -> TermPoint {
+        let row = row.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        let offset = self.term.grid().display_offset();
+        viewport_to_point(offset, TermPoint::new(row, Column(col)))
     }
 
     /// 累计收到的字节数（诊断用）。
@@ -219,6 +356,11 @@ impl Terminal {
         scene.background = Color::rgb(DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2]);
         let bg_color = scene.background;
 
+        let selection = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
         let content = self.term.renderable_content();
         let visible_rows = self.term.grid().screen_lines().min(self.rows);
         let offset = content.display_offset;
@@ -240,6 +382,9 @@ impl Terminal {
             let mut bg = to_zzz_color(cell.bg, DEFAULT_BG);
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
+            }
+            if selection.is_some_and(|range: SelectionRange| range.contains(indexed.point)) {
+                bg = Color::rgb(SELECTION_BG[0], SELECTION_BG[1], SELECTION_BG[2]);
             }
             if flags.contains(Flags::DIM) && !flags.contains(Flags::DIM_BOLD) {
                 fg = blend(fg, bg, 0.5);
@@ -514,5 +659,38 @@ mod tests {
         term.render(800, 400, 1.0, 0.0, 0.0);
         let image = term.image().expect("渲染出位图");
         assert_eq!((image.width, image.height), (800, 400));
+    }
+
+    #[test]
+    fn terminal_answers_primary_device_attribute_query() {
+        // fish 启动时会发 DA1 并等待应答；不写回 PTY 就会等 10 秒后告警。
+        let mut term = Terminal::new(20, 5, "monospace".to_owned(), 8.0);
+        term.advance(b"\x1b[c");
+        assert_eq!(term.take_responses(), b"\x1b[?6c");
+        assert!(term.take_responses().is_empty(), "响应只能被取走一次");
+    }
+
+    #[test]
+    fn selection_extracts_text() {
+        let mut term = Terminal::new(20, 5, "monospace".to_owned(), 8.0);
+        term.advance(b"hello world");
+        term.start_selection(0, 0);
+        term.update_selection(0, 4);
+        assert_eq!(term.selection_text().as_deref(), Some("hello"));
+
+        // 反向拖动两端的格子也要包含，不能各缩一格。
+        term.start_selection(0, 10);
+        term.update_selection(0, 6);
+        assert_eq!(term.selection_text().as_deref(), Some("world"));
+        term.start_selection(0, 6);
+        term.update_selection(0, 10);
+        assert_eq!(term.selection_text().as_deref(), Some("world"));
+
+        term.clear_selection();
+        assert!(term.selection_text().is_none());
+
+        term.select_all();
+        let text = term.selection_text().unwrap_or_default();
+        assert!(text.contains("hello world"));
     }
 }

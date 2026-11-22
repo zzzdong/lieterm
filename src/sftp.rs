@@ -93,22 +93,31 @@ async fn run(
             },
             SftpAction::Upload { local, remote } => match tokio::fs::read(&local).await {
                 Ok(bytes) => {
-                    if let Err(err) = sftp.write(&remote, &bytes).await {
-                        bridge.notify(SshEvent::SftpError(format!("上传 {remote} 失败：{err}")));
-                        continue;
-                    }
-                    let parent = parent_path(&remote);
-                    let notice = format!("已上传 {} → {}（{} 字节）", local, remote, bytes.len());
-                    match list(&sftp, &parent).await {
-                        Ok(entries) => {
-                            bridge.notify(SshEvent::SftpNotice(notice));
-                            bridge.notify(SshEvent::SftpListing {
-                                path: parent,
-                                entries,
-                            });
+                    // `SftpSession::write` 只带 WRITE 标志：远端文件不存在会失败，
+                    // 已存在时会保留旧文件尾部。create() 用 CREATE|TRUNCATE|WRITE。
+                    match upload(&sftp, &remote, &bytes).await {
+                        Ok(()) => {
+                            let parent = parent_path(&remote);
+                            let notice =
+                                format!("已上传 {} → {}（{} 字节）", local, remote, bytes.len());
+                            match list(&sftp, &parent).await {
+                                Ok(entries) => {
+                                    bridge.notify(SshEvent::SftpNotice(notice));
+                                    bridge.notify(SshEvent::SftpListing {
+                                        path: parent,
+                                        entries,
+                                    });
+                                }
+                                Err(err) => {
+                                    bridge.notify(SshEvent::SftpError(format!(
+                                        "刷新目录失败：{err}"
+                                    )));
+                                }
+                            }
                         }
                         Err(err) => {
-                            bridge.notify(SshEvent::SftpError(format!("刷新目录失败：{err}")));
+                            bridge
+                                .notify(SshEvent::SftpError(format!("上传 {remote} 失败：{err}")));
                         }
                     }
                 }
@@ -126,6 +135,24 @@ async fn run(
     let _ = session
         .disconnect(Disconnect::ByApplication, "lieterm sftp close", "zh")
         .await;
+    Ok(())
+}
+
+/// 覆盖写入远端文件：不存在则创建，存在则截断。
+async fn upload(sftp: &SftpSession, remote: &str, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut file = sftp
+        .create(remote)
+        .await
+        .with_context(|| format!("打开远端文件 {remote}"))?;
+    if let Err(err) = file.write_all(bytes).await {
+        let _ = file.close().await;
+        return Err(err).with_context(|| format!("写入远端文件 {remote}"));
+    }
+    file.close()
+        .await
+        .with_context(|| format!("关闭远端文件 {remote}"))?;
     Ok(())
 }
 

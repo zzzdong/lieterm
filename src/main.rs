@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod keys;
 mod known_hosts;
 mod local;
@@ -6,6 +7,7 @@ mod sftp;
 mod ssh;
 mod ssh_config;
 mod term;
+mod transfer;
 
 use anyhow::Result;
 use zzzui::platform::{WindowOptions, run};

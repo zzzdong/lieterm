@@ -4,7 +4,7 @@
 //! 因而终端渲染、键盘编码、resize 都能在没有 SSH 服务器的环境下真实验证。
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -53,6 +53,94 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// 探测当前操作系统上可用的本地 shell：(显示名, 可执行路径)。
+///
+/// - Unix：`$SHELL` 优先，其次 `/etc/shells`，最后按常见 shell 名在 `PATH` 里查找；
+/// - Windows：探测 pwsh / Windows PowerShell / Git Bash / cmd；
+/// - 结果为绝对路径，找不到任何候选时回退到 [`default_shell`]。
+#[must_use]
+pub fn available_shells() -> Vec<(String, String)> {
+    let mut shells = platform_shells();
+    if shells.is_empty() {
+        let fallback = default_shell();
+        shells.push((fallback.clone(), fallback));
+    }
+    shells
+}
+
+/// 按 `path` 追加一项；不存在 / 重复时忽略。显示名用文件名 + 完整路径。
+#[cfg(unix)]
+fn push_unix_shell(out: &mut Vec<(String, String)>, path: PathBuf) {
+    if !path.is_file() {
+        return;
+    }
+    let path = path.to_string_lossy().into_owned();
+    if out.iter().any(|(_, existing)| *existing == path) {
+        return;
+    }
+    let name = Path::new(&path)
+        .file_name()
+        .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+    out.push((format!("{name} ({path})"), path));
+}
+
+#[cfg(unix)]
+fn platform_shells() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(shell) = std::env::var_os("SHELL") {
+        push_unix_shell(&mut out, PathBuf::from(shell));
+    }
+    if let Ok(list) = std::fs::read_to_string("/etc/shells") {
+        for line in list.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            push_unix_shell(&mut out, PathBuf::from(line));
+        }
+    }
+    for name in ["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh", "xonsh"] {
+        if let Some(path) = which(name) {
+            push_unix_shell(&mut out, path);
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn platform_shells() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, command) in [
+        ("PowerShell 7", "pwsh.exe"),
+        ("Windows PowerShell", "powershell.exe"),
+        ("Git Bash", "bash.exe"),
+        ("命令提示符", "cmd.exe"),
+    ] {
+        if let Some(path) = which(command) {
+            out.push((
+                format!("{name} ({})", path.display()),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    // Git for Windows 默认不把 `bin` 放进 PATH，单独探测安装目录。
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        let git_bash = PathBuf::from(program_files).join(r"Git\bin\bash.exe");
+        if git_bash.is_file() {
+            let path = git_bash.to_string_lossy().into_owned();
+            if !out.iter().any(|(_, existing)| *existing == path) {
+                out.push((format!("Git Bash ({path})"), path));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_shells() -> Vec<(String, String)> {
+    Vec::new()
 }
 
 /// 在后台线程里跑一个本地 shell；`input` 与 SSH 会话同一条通道（输入 / resize）。
@@ -213,5 +301,22 @@ mod tests {
             std::path::Path::new(&shell).is_file(),
             "默认 shell 应是可执行文件: {shell}"
         );
+    }
+
+    #[test]
+    fn available_shells_are_nonempty_and_unique() {
+        let shells = available_shells();
+        assert!(!shells.is_empty(), "至少要探测到一个 shell");
+        let mut seen = std::collections::HashSet::new();
+        for (name, command) in &shells {
+            assert!(!name.is_empty());
+            assert!(!command.is_empty());
+            assert!(seen.insert(command.clone()), "shell 重复: {command}");
+            #[cfg(unix)]
+            assert!(
+                std::path::Path::new(command).is_file(),
+                "探测到的 shell 应存在: {command}"
+            );
+        }
     }
 }

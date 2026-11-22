@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use russh::keys::HashAlg;
 use russh::keys::PublicKeyOrCertificate;
+#[cfg(any(unix, windows))]
+use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::{ChannelMsg, Disconnect, client};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -54,15 +57,18 @@ pub(crate) struct AuthOptions {
     pub known_hosts: Option<PathBuf>,
 }
 
+/// 认证阶段的总超时：服务器半开连接时不能无限等待。
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// 连接阶段（TCP + 握手）超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 建立已认证的 SSH 会话；返回会话与用于状态栏的 `user@host:port`。
 pub(crate) async fn connect_authenticated(
     options: AuthOptions,
 ) -> Result<(client::Handle<ClientHandler>, String)> {
-    let resolved = if options.host.parse::<std::net::IpAddr>().is_ok() {
-        ssh_config::Resolved::default()
-    } else {
-        ssh_config::resolve(&options.host)
-    };
+    // 对 IP 也读 `~/.ssh/config`：这样 `Host *` 里的 User / IdentityFile / Port
+    // 才能作为兜底（与 OpenSSH 一致），而不仅是别名。
+    let resolved = ssh_config::resolve(&options.host);
     let host = resolved.hostname.unwrap_or_else(|| options.host.clone());
     let port = if options.port == 22 {
         resolved.port.unwrap_or(options.port)
@@ -101,53 +107,207 @@ pub(crate) async fn connect_authenticated(
         keepalive_max: 3,
         ..Default::default()
     });
-    let address = format!("{host}:{port}");
+    let address = socket_address(&host, port);
     let mut session = match tokio::time::timeout(
-        Duration::from_secs(15),
+        CONNECT_TIMEOUT,
         client::connect(config, address.clone(), handler),
     )
     .await
     {
         Ok(Ok(session)) => session,
         Ok(Err(err)) => {
-            let rejected = rejected.lock().ok().and_then(|slot| slot.clone());
-            if let Some(fingerprint) = rejected {
-                bail!("主机密钥不匹配（{fingerprint}）：可能存在中间人攻击，已拒绝连接");
+            let reason = rejected.lock().ok().and_then(|slot| slot.clone());
+            if let Some(reason) = reason {
+                bail!("主机密钥被拒绝（{reason}）：主机密钥已变更或已被撤销，已拒绝连接");
             }
             bail!("连接 {address} 失败：{err}");
         }
-        Err(_) => bail!("连接 {address} 超时（15s）"),
+        Err(_) => bail!("连接 {address} 超时（{}s）", CONNECT_TIMEOUT.as_secs()),
     };
 
-    let mut authenticated = false;
-    if let Some(path) = identity.or_else(scan_identity) {
-        match load_private_key(&path, &options.password) {
-            Ok(key) => {
-                let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                match session.authenticate_publickey(&user, key).await {
-                    Ok(auth) if auth.success() => authenticated = true,
-                    Ok(_) => eprintln!("[lieterm] 公钥认证被拒绝：{}", path.display()),
-                    Err(err) => eprintln!("[lieterm] 公钥认证失败：{err}"),
-                }
-            }
-            Err(err) => eprintln!("[lieterm] 读取私钥 {} 失败：{err}", path.display()),
-        }
-    }
-    if !authenticated && !options.password.is_empty() {
-        let auth = session
-            .authenticate_password(&user, &options.password)
-            .await
-            .context("密码认证失败")?;
-        authenticated = auth.success();
-    }
-    if !authenticated {
-        authenticated = keyboard_interactive(&mut session, &user, &options.password).await?;
-    }
+    let authenticated = match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        authenticate(&mut session, &user, &options.password, identity),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("认证超时（{}s）", AUTH_TIMEOUT.as_secs()),
+    };
     if !authenticated {
         bail!("认证失败：公钥、密码与键盘交互均被拒绝");
     }
 
     Ok((session, format!("{user}@{host}:{port}")))
+}
+
+/// 依次尝试：指定/默认私钥 → 密码 → 键盘交互（密码回填）。
+async fn authenticate(
+    session: &mut client::Handle<ClientHandler>,
+    user: &str,
+    password: &str,
+    identity: Option<PathBuf>,
+) -> Result<bool> {
+    // RFC 4252 的 "none"：空密码账号等场景下服务器可能直接接受，不计入失败次数。
+    if session.authenticate_none(user).await?.success() {
+        return Ok(true);
+    }
+
+    let use_agent = identity.is_none();
+    let mut rsa_hash = None;
+
+    // 未显式指定私钥时优先尝试 ssh-agent / Pageant；显式指定时不混入 agent 的
+    // 其它身份，避免用错密钥或耗尽 MaxAuthTries。
+    if use_agent && try_agent_auth(session, user, &mut rsa_hash).await? {
+        return Ok(true);
+    }
+
+    let paths = match identity {
+        Some(path) => vec![path],
+        None => default_identities(),
+    };
+    let mut keys = Vec::new();
+    for path in paths {
+        match load_private_key(&path, password) {
+            Ok(key) => keys.push((path, key)),
+            Err(err) => eprintln!("[lieterm] 读取私钥 {} 失败：{err}", path.display()),
+        }
+    }
+
+    // 只为 RSA 查询服务端支持的签名算法：`None` 在 russh 里等价于已废弃的
+    // `ssh-rsa`（SHA-1），现代 OpenSSH 默认拒绝。EXT_INFO 缺失时先试 SHA-256，
+    // 再退回 SHA-1 兼容老服务器。agent 认证阶段已查询过则直接复用。
+    let rsa_hash = if keys.iter().any(|(_, key)| key.algorithm().is_rsa()) {
+        match rsa_hash {
+            Some(cached) => Some(cached),
+            None => session.best_supported_rsa_hash().await.ok().flatten(),
+        }
+    } else {
+        rsa_hash
+    };
+
+    for (path, key) in keys {
+        let hash_algs = if key.algorithm().is_rsa() {
+            match rsa_hash {
+                Some(Some(alg)) => vec![Some(alg)],
+                Some(None) => vec![None],
+                None => vec![Some(HashAlg::Sha256), None],
+            }
+        } else {
+            vec![None]
+        };
+        for hash_alg in hash_algs {
+            let candidate = PrivateKeyWithHashAlg::new(Arc::new(key.clone()), hash_alg);
+            match session.authenticate_publickey(user, candidate).await {
+                Ok(auth) if auth.success() => return Ok(true),
+                Ok(_) => eprintln!("[lieterm] 公钥认证被拒绝：{}", path.display()),
+                Err(err) => {
+                    eprintln!("[lieterm] 公钥认证失败 {}：{err}", path.display());
+                    break;
+                }
+            }
+        }
+    }
+
+    if !password.is_empty() {
+        let auth = session
+            .authenticate_password(user, password)
+            .await
+            .context("密码认证失败")?;
+        if auth.success() {
+            return Ok(true);
+        }
+    }
+
+    keyboard_interactive(session, user, password).await
+}
+
+/// 连接本机 ssh-agent（Unix）或 Pageant（Windows）。
+#[cfg(unix)]
+async fn try_agent_auth(
+    session: &mut client::Handle<ClientHandler>,
+    user: &str,
+    rsa_hash: &mut Option<Option<HashAlg>>,
+) -> Result<bool> {
+    let mut agent = match AgentClient::connect_env().await {
+        Ok(agent) => agent,
+        Err(err) => {
+            eprintln!("[lieterm] ssh-agent 不可用（{err}），跳过");
+            return Ok(false);
+        }
+    };
+    agent_auth(session, user, &mut agent, rsa_hash).await
+}
+
+/// Pageant 只存在于 Windows；未设置时静默跳过。
+#[cfg(windows)]
+async fn try_agent_auth(
+    session: &mut client::Handle<ClientHandler>,
+    user: &str,
+    rsa_hash: &mut Option<Option<HashAlg>>,
+) -> Result<bool> {
+    let mut agent = match AgentClient::connect_pageant().await {
+        Ok(agent) => agent,
+        Err(err) => {
+            eprintln!("[lieterm] Pageant 不可用（{err}），跳过");
+            return Ok(false);
+        }
+    };
+    agent_auth(session, user, &mut agent, rsa_hash).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn try_agent_auth(
+    _session: &mut client::Handle<ClientHandler>,
+    _user: &str,
+    _rsa_hash: &mut Option<Option<HashAlg>>,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// 用 agent 中的身份逐个尝试公钥认证；agent 不可用不应阻断后续认证方式。
+#[cfg(any(unix, windows))]
+async fn agent_auth<S>(
+    session: &mut client::Handle<ClientHandler>,
+    user: &str,
+    agent: &mut AgentClient<S>,
+    rsa_hash: &mut Option<Option<HashAlg>>,
+) -> Result<bool>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(err) => {
+            eprintln!("[lieterm] 读取 ssh-agent 身份失败（{err}），跳过");
+            return Ok(false);
+        }
+    };
+
+    for identity in identities {
+        let key = identity.public_key().into_owned();
+        let hash = if key.algorithm().is_rsa() {
+            match *rsa_hash {
+                Some(hash) => hash,
+                None => {
+                    let supported = session.best_supported_rsa_hash().await.ok().flatten();
+                    *rsa_hash = supported;
+                    supported.flatten()
+                }
+            }
+        } else {
+            None
+        };
+        match session
+            .authenticate_publickey_with(user, key, hash, agent)
+            .await
+        {
+            Ok(auth) if auth.success() => return Ok(true),
+            Ok(_) => eprintln!("[lieterm] ssh-agent 密钥被拒绝：{}", identity.comment()),
+            Err(err) => eprintln!("[lieterm] ssh-agent 签名失败：{err}"),
+        }
+    }
+    Ok(false)
 }
 impl client::Handler for ClientHandler {
     type Error = anyhow::Error;
@@ -187,6 +347,17 @@ impl client::Handler for ClientHandler {
                 );
                 if let Ok(mut rejected) = self.rejected.lock() {
                     *rejected = Some(fingerprint);
+                }
+                Ok(false)
+            }
+            HostKeyStatus::Revoked => {
+                let fingerprint = public.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+                eprintln!(
+                    "[lieterm] 主机密钥已在 known_hosts 中撤销 {}：{fingerprint}",
+                    self.host_token
+                );
+                if let Ok(mut rejected) = self.rejected.lock() {
+                    *rejected = Some(format!("{fingerprint}，known_hosts 中标记为 @revoked"));
                 }
                 Ok(false)
             }
@@ -324,13 +495,28 @@ fn load_private_key(path: &Path, password: &str) -> Result<russh::keys::PrivateK
     russh::keys::load_secret_key(path, Some(password)).map_err(Into::into)
 }
 
-/// 没有指定私钥时，扫描 `~/.ssh/id_*` 的常见默认密钥。
-fn scan_identity() -> Option<PathBuf> {
-    let home = crate::known_hosts::home_dir()?;
+/// 没有指定私钥时，按顺序尝试 `~/.ssh` 下所有常见默认密钥。
+///
+/// 只取第一个存在的文件（旧行为）会在 `id_ed25519` 存在但未被服务器授权、
+/// 而 `id_rsa` 已授权时直接认证失败；逐个尝试才与 OpenSSH 一致。
+fn default_identities() -> Vec<PathBuf> {
+    let Some(home) = crate::known_hosts::home_dir() else {
+        return Vec::new();
+    };
     ["id_ed25519", "id_ecdsa", "id_rsa"]
         .into_iter()
         .map(|name| home.join(".ssh").join(name))
-        .find(|path| path.is_file())
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// TCP 地址：IPv6 字面量要加方括号（`[::1]:22`），否则 `host:port` 无法解析。
+fn socket_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// 展开 `~`（对话框里可能手写 `~/.ssh/id_ed25519`）。
@@ -440,7 +626,7 @@ mod tests {
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let bridge = crate::app::Bridge::from_events(event_tx);
+        let bridge = crate::app::Bridge::from_events(0, event_tx);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let options = ConnectOptions {
             host: "127.0.0.1".to_owned(),
@@ -462,23 +648,24 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline && !(connected && banner && echo) {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
-                Ok(Some(SshEvent::Connected(label))) => {
+                Ok(Some((_, SshEvent::Connected(label)))) => {
                     assert!(label.contains("tester@127.0.0.1"), "{label}");
                     connected = true;
                 }
-                Ok(Some(SshEvent::Data(bytes))) => {
+                Ok(Some((_, SshEvent::Data(bytes)))) => {
                     let text = String::from_utf8_lossy(&bytes);
                     banner |= text.contains("hello from ssh");
                     echo |= text.contains("ping");
                 }
-                Ok(Some(SshEvent::Error(err))) => panic!("SSH 错误：{err}"),
-                Ok(Some(
+                Ok(Some((_, SshEvent::Error(err)))) => panic!("SSH 错误：{err}"),
+                Ok(Some((
+                    _,
                     SshEvent::SftpReady { .. }
                     | SshEvent::SftpListing { .. }
                     | SshEvent::SftpNotice(_)
                     | SshEvent::SftpError(_),
-                ))
-                | Ok(Some(SshEvent::Closed))
+                )))
+                | Ok(Some((_, SshEvent::Closed)))
                 | Ok(None)
                 | Err(_) => {}
             }
@@ -492,6 +679,13 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server_join).await;
         assert!(known.exists(), "known_hosts 应记录主机密钥");
     }
+    #[test]
+    fn socket_address_brackets_ipv6_literals() {
+        assert_eq!(socket_address("127.0.0.1", 22), "127.0.0.1:22");
+        assert_eq!(socket_address("::1", 2222), "[::1]:2222");
+        assert_eq!(socket_address("[::1]", 2222), "[::1]:2222");
+    }
+
     #[tokio::test]
     async fn changed_host_key_is_rejected() {
         let temp = std::env::temp_dir().join(format!("lieterm-hostkey-{}", std::process::id()));
