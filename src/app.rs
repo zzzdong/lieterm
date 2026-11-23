@@ -26,7 +26,9 @@ use zzzui::{
 
 use crate::{
     config::{self, Config, Macro, SessionProfile, macro_bytes},
-    keys, local, sftp,
+    keys, local,
+    manager_host::ManagerHost,
+    sftp,
     sftp::SftpAction,
     ssh,
     ssh::{AuthOptions, ConnectOptions},
@@ -60,10 +62,10 @@ const QUICK_WIDTH: f64 = 260.0;
 const QUICK_ENTRY_BASE: LocalKey = 1000;
 const QUICK_MENU_SLOT: LocalKey = 991;
 /// 会话 / 宏管理浮层与列表项槽位。
-const SESSIONS_SLOT: LocalKey = 940;
-const MACROS_SLOT: LocalKey = 941;
-const SESSION_ENTRY_BASE: LocalKey = 950;
-const MACRO_ENTRY_BASE: LocalKey = 960;
+pub(crate) const SESSIONS_SLOT: LocalKey = 940;
+pub(crate) const MACROS_SLOT: LocalKey = 941;
+pub(crate) const SESSION_ENTRY_BASE: LocalKey = 950;
+pub(crate) const MACRO_ENTRY_BASE: LocalKey = 960;
 /// 终端右键菜单与 rz 上传路径对话框。
 const CONTEXT_SLOT: LocalKey = 980;
 const UPLOAD_SLOT: LocalKey = 981;
@@ -160,6 +162,7 @@ impl Geometry {
 zzzui::key_enum! {
     enum DialogHostKey {
         Connect,
+        Managers,
     }
 }
 
@@ -433,6 +436,22 @@ impl Default for ConnectForm {
     }
 }
 
+/// 会话 / 宏管理浮层的只读快照：Root 每帧同步，ManagerHost 据此声明浮层。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ManagerForm {
+    pub sessions: Vec<SessionProfile>,
+    pub macros: Vec<Macro>,
+    pub sessions_open: bool,
+    pub macros_open: bool,
+    pub session_name: String,
+    pub session_selected: Option<usize>,
+    pub macro_name: String,
+    pub macro_text: String,
+    pub macro_enter: bool,
+    pub macro_selected: Option<usize>,
+    pub notice: String,
+}
+
 impl Default for Shared {
     fn default() -> Self {
         Self {
@@ -501,8 +520,6 @@ impl Bridge {
 struct Root {
     shared: Arc<Mutex<Shared>>,
     actions: std_mpsc::Sender<UiAction>,
-    /// 给 ConnectHost 的只读快照，每帧从本组件的字段同步。
-    form_snapshot: Arc<Mutex<ConnectForm>>,
 
     host: String,
     port: String,
@@ -554,19 +571,19 @@ struct Root {
 }
 
 impl Widget for Root {
-    /// 连接对话框是独立子组件：自己声明浮层、认领浮层内命令，再以事件上报。
+    /// 连接对话框与管理浮层是独立子组件：自己声明浮层、认领浮层内命令，再以事件上报。
     fn children(&self) -> Vec<zzzui::widget::ChildDecl> {
-        vec![zzzui::widget::ChildDecl::new(
-            DialogHostKey::Connect,
-            {
-                let form = Arc::clone(&self.form_snapshot);
-                move || Box::new(crate::connect_host::ConnectHost::new(Arc::clone(&form)))
-            },
-        )]
+        vec![
+            zzzui::widget::ChildDecl::new(DialogHostKey::Connect, || {
+                Box::new(crate::connect_host::ConnectHost::new())
+            })
+            .props(self.connect_props()),
+            zzzui::widget::ChildDecl::new(DialogHostKey::Managers, || Box::new(ManagerHost::new()))
+                .props(self.manager_props()),
+        ]
     }
 
     fn view(&self, theme: &UiTheme) -> ViewNode {
-        self.sync_form();
         let shared = self.shared.lock().expect("shared lock");
         let width = shared.width.max(1.0);
         let height = shared.height.max(1.0);
@@ -615,6 +632,7 @@ impl Widget for Root {
             children.extend(tab_bar);
             children.push(body);
             children.push(self.status_view(theme, &shared));
+            children.extend(Self::host_slots());
             Column::new()
                 .width(width)
                 .height(height)
@@ -646,6 +664,7 @@ impl Widget for Root {
             } else {
                 children.push(content);
             }
+            children.extend(Self::host_slots());
             Column::new()
                 .width(width)
                 .height(height)
@@ -656,9 +675,8 @@ impl Widget for Root {
     }
 
     fn overlays(&self, owner: NodeKey, theme: &UiTheme) -> Vec<OverlayView> {
-        self.sync_form();
         let shared = self.shared.lock().expect("shared lock");
-        // 连接对话框与 shell/auth 下拉已交给 ConnectHost 子组件声明。
+        // 连接对话框、shell/auth 下拉与会话/宏管理浮层已交给子组件声明。
         let upload = shared
             .upload_open
             .then(|| (shared.upload_path.clone(), shared.upload_notice.clone()));
@@ -667,13 +685,6 @@ impl Widget for Root {
 
         if let Some((path, notice)) = upload {
             out.push(self.upload_dialog(owner, theme, &path, &notice));
-        }
-
-        if self.sessions_open {
-            out.push(self.session_manager(owner, theme));
-        }
-        if self.macros_open {
-            out.push(self.macro_manager(owner, theme));
         }
 
         if let Some(index) = self.open_menu {
@@ -741,24 +752,49 @@ impl Widget for Root {
     }
 }
 impl Root {
-    /// 把当前表单字段写进快照，供 ConnectHost 声明浮层时读取。
-    fn sync_form(&self) {
+    /// 两个宿主只声明浮层；主树里留 0×0 槽位，把「归属」显式写进布局树。
+    fn host_slots() -> [ViewNode; 2] {
+        [
+            ViewNode::child_slot(DialogHostKey::Connect.local()),
+            ViewNode::child_slot(DialogHostKey::Managers.local()),
+        ]
+    }
+
+    /// Root 表单状态 → ConnectHost 的 props；每次重建由 `children()` 取一次。
+    fn connect_props(&self) -> ConnectForm {
         let shared = self.shared.lock().expect("shared lock");
-        if let Ok(mut form) = self.form_snapshot.lock() {
-            form.host = self.host.clone();
-            form.port = self.port.clone();
-            form.user = self.user.clone();
-            form.password = self.password.clone();
-            form.identity = self.identity.clone();
-            form.auth = self.auth;
-            form.tab = self.tab;
-            form.shell = self.shell;
-            form.shells = self.shells.clone();
-            form.dialog_open = shared.dialog_open && !self.sessions_open && !self.macros_open;
-            form.shell_open = self.shell_open;
-            form.auth_open = self.auth_open;
-            form.failure = (shared.screen == Screen::Failed && !shared.label.is_empty())
-                .then(|| shared.label.clone());
+        ConnectForm {
+            host: self.host.clone(),
+            port: self.port.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            identity: self.identity.clone(),
+            auth: self.auth,
+            tab: self.tab,
+            shell: self.shell,
+            shells: self.shells.clone(),
+            dialog_open: shared.dialog_open && !self.sessions_open && !self.macros_open,
+            shell_open: self.shell_open,
+            auth_open: self.auth_open,
+            failure: (shared.screen == Screen::Failed && !shared.label.is_empty())
+                .then(|| shared.label.clone()),
+        }
+    }
+
+    /// Root 管理状态 → ManagerHost 的 props。
+    fn manager_props(&self) -> ManagerForm {
+        ManagerForm {
+            sessions: self.config.sessions.clone(),
+            macros: self.config.macros.clone(),
+            sessions_open: self.sessions_open,
+            macros_open: self.macros_open,
+            session_name: self.session_name.clone(),
+            session_selected: self.session_selected,
+            macro_name: self.macro_name.clone(),
+            macro_text: self.macro_text.clone(),
+            macro_enter: self.macro_enter,
+            macro_selected: self.macro_selected,
+            notice: self.manager_notice.clone(),
         }
     }
 
@@ -827,31 +863,266 @@ impl Root {
         false
     }
 
+    /// 认领 ManagerHost 上报的事件：管理浮层的业务状态仍由 Root 维护。
+    fn on_manager_event(&mut self, command: &RawCommand, ctx: &mut UpdateCtx) -> bool {
+        use crate::manager_host::{ManagerEvent, ManagerKind};
+
+        let Some(event) = command.event::<ManagerEvent>() else {
+            return false;
+        };
+        match event {
+            ManagerEvent::Edit { act, value } => match *act {
+                Act::SessionName => self.session_name = value.clone(),
+                Act::MacroName => self.macro_name = value.clone(),
+                Act::MacroText => self.macro_text = value.clone(),
+                _ => return false,
+            },
+            ManagerEvent::Action(act) => return self.on_manager_action(*act, ctx),
+            ManagerEvent::Select { kind, index } => match kind {
+                ManagerKind::Sessions => {
+                    if let Some(profile) = self.config.sessions.get(*index) {
+                        self.session_selected = Some(*index);
+                        self.session_name = profile.name.clone();
+                        self.manager_notice.clear();
+                    }
+                }
+                ManagerKind::Macros => {
+                    if let Some(entry) = self.config.macros.get(*index) {
+                        self.macro_selected = Some(*index);
+                        self.macro_name = entry.name.clone();
+                        self.macro_text = entry.text.clone();
+                        self.macro_enter = entry.enter;
+                        self.manager_notice.clear();
+                    }
+                }
+            },
+            ManagerEvent::Dismiss(kind) => {
+                match kind {
+                    ManagerKind::Sessions => self.sessions_open = false,
+                    ManagerKind::Macros => self.macros_open = false,
+                }
+                self.manager_notice.clear();
+            }
+        }
+        ctx.mark_dirty();
+        true
+    }
+
+    /// 会话 / 宏管理浮层里的按钮动作。
+    fn on_manager_action(&mut self, act: Act, ctx: &mut UpdateCtx) -> bool {
+        match act {
+            Act::SessionConnect => {
+                let Some(index) = self.session_selected else {
+                    self.manager_notice = "请先在列表中选择一个会话".to_owned();
+                    ctx.mark_dirty();
+                    return true;
+                };
+                let Some(profile) = self.config.sessions.get(index).cloned() else {
+                    return true;
+                };
+                self.host = profile.host;
+                self.port = profile.port.to_string();
+                self.user = profile.user;
+                self.identity = profile.identity;
+                // 密码不落盘：载入后必须重新输入；有密钥路径时默认切到密钥模式。
+                self.password.clear();
+                self.auth = if self.identity.trim().is_empty() {
+                    0
+                } else {
+                    1
+                };
+                self.session_name = profile.name;
+                self.tab = 1;
+                self.shell_open = false;
+                self.sessions_open = false;
+                self.manager_notice.clear();
+                self.set_dialog(true);
+                ctx.mark_dirty();
+                true
+            }
+            Act::SessionSave => {
+                let name = self.session_name.trim().to_owned();
+                if name.is_empty() {
+                    self.manager_notice = "请先填写会话名称".to_owned();
+                } else {
+                    self.config.upsert_session(SessionProfile {
+                        name: name.clone(),
+                        host: self.host.trim().to_owned(),
+                        port: self.port.trim().parse().unwrap_or(22),
+                        user: self.user.trim().to_owned(),
+                        // 密码模式的密钥字段不落盘，避免载入后被误当成密钥登录。
+                        identity: if self.auth == 1 {
+                            self.identity.trim().to_owned()
+                        } else {
+                            String::new()
+                        },
+                    });
+                    self.session_selected = self
+                        .config
+                        .sessions
+                        .iter()
+                        .position(|session| session.name == name);
+                    self.manager_notice = match self.save_config() {
+                        Ok(()) => format!("已保存会话 {name}"),
+                        Err(err) => err,
+                    };
+                }
+                ctx.mark_dirty();
+                true
+            }
+            Act::SessionDelete => {
+                let Some(index) = self.session_selected else {
+                    self.manager_notice = "请先在列表中选择一个会话".to_owned();
+                    ctx.mark_dirty();
+                    return true;
+                };
+                let name = self
+                    .config
+                    .sessions
+                    .get(index)
+                    .map(|session| session.name.clone())
+                    .unwrap_or_default();
+                if self.config.remove_session(index) {
+                    self.session_selected = (!self.config.sessions.is_empty())
+                        .then(|| index.min(self.config.sessions.len() - 1));
+                    self.session_name.clear();
+                    self.manager_notice = match self.save_config() {
+                        Ok(()) => format!("已删除会话 {name}"),
+                        Err(err) => err,
+                    };
+                }
+                ctx.mark_dirty();
+                true
+            }
+            Act::SessionClose => {
+                self.sessions_open = false;
+                self.manager_notice.clear();
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroEnter => {
+                self.macro_enter = !self.macro_enter;
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroNew => {
+                self.macro_selected = None;
+                self.macro_name.clear();
+                self.macro_text.clear();
+                self.macro_enter = false;
+                self.manager_notice = "填写名称和内容后点保存".to_owned();
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroSave => {
+                let name = self.macro_name.trim().to_owned();
+                if name.is_empty() {
+                    self.manager_notice = "请先填写宏名称".to_owned();
+                } else {
+                    let entry = Macro {
+                        name: name.clone(),
+                        text: self.macro_text.clone(),
+                        enter: self.macro_enter,
+                    };
+                    if let Some(index) = self.macro_selected {
+                        self.config.replace_macro(index, entry);
+                    } else {
+                        self.config.upsert_macro(entry);
+                    }
+                    self.macro_selected = self
+                        .config
+                        .macros
+                        .iter()
+                        .position(|macros| macros.name == name);
+                    self.manager_notice = match self.save_config() {
+                        Ok(()) => format!("已保存宏 {name}"),
+                        Err(err) => err,
+                    };
+                }
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroRun => {
+                if self.macro_text.is_empty() {
+                    self.manager_notice = "宏内容为空".to_owned();
+                    ctx.mark_dirty();
+                    return true;
+                }
+                let (screen, input) = {
+                    let shared = self.shared.lock().expect("shared lock");
+                    (shared.screen, Arc::clone(&shared.input))
+                };
+                if screen != Screen::Session {
+                    self.manager_notice = "宏只能在已连接的会话中运行".to_owned();
+                    ctx.mark_dirty();
+                    return true;
+                }
+                let bytes = macro_bytes(&self.macro_text, self.macro_enter);
+                let sent = input.lock().is_ok_and(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|sender| sender.send(UiEvent::Input(bytes)).is_ok())
+                });
+                if sent {
+                    self.macros_open = false;
+                    self.manager_notice.clear();
+                } else {
+                    self.manager_notice = "发送失败：当前没有输入通道".to_owned();
+                }
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroDelete => {
+                let Some(index) = self.macro_selected else {
+                    self.manager_notice = "请先在列表中选择一个宏".to_owned();
+                    ctx.mark_dirty();
+                    return true;
+                };
+                let name = self
+                    .config
+                    .macros
+                    .get(index)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_default();
+                if self.config.remove_macro(index) {
+                    self.macro_selected = (!self.config.macros.is_empty())
+                        .then(|| index.min(self.config.macros.len() - 1));
+                    self.macro_name.clear();
+                    self.macro_text.clear();
+                    self.macro_enter = false;
+                    self.manager_notice = match self.save_config() {
+                        Ok(()) => format!("已删除宏 {name}"),
+                        Err(err) => err,
+                    };
+                }
+                ctx.mark_dirty();
+                true
+            }
+            Act::MacroClose => {
+                self.macros_open = false;
+                self.manager_notice.clear();
+                ctx.mark_dirty();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn on_command_inner(
         &mut self,
         owner: NodeKey,
         command: &RawCommand,
         ctx: &mut UpdateCtx,
     ) -> bool {
-        // 0. ConnectHost 上报的对话框事件（浮层命令已由子组件认领）。
+        // 0. ConnectHost / ManagerHost 上报的浮层事件（浮层命令已由子组件认领）。
         if self.on_dialog_event(command, ctx) {
             return true;
         }
+        if self.on_manager_event(command, ctx) {
+            return true;
+        }
 
-        // 1. 浮层关闭请求：对话框 / 管理浮层 / 菜单栏下拉 / shell 下拉各自只关自己。
+        // 1. 浮层关闭请求：菜单栏下拉 / 右键菜单等各自只关自己。
         if let RawCommand::OverlayDismiss { key, .. } = command {
-            if self.sessions_open && *key == child_key(owner, SESSIONS_SLOT) {
-                self.sessions_open = false;
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
-            if self.macros_open && *key == child_key(owner, MACROS_SLOT) {
-                self.macros_open = false;
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
             if self.context_menu.is_some() && *key == child_key(owner, CONTEXT_SLOT) {
                 self.context_menu = None;
                 ctx.mark_dirty();
@@ -894,14 +1165,11 @@ impl Root {
                         shared.sftp.local_path = value.to_string();
                     }
                 }
-                Some(Act::SessionName) => self.session_name = value.to_string(),
                 Some(Act::QuickName) => self.session_name = value.to_string(),
                 Some(Act::QuickHost) => self.host = value.to_string(),
                 Some(Act::QuickPort) => self.port = value.to_string(),
                 Some(Act::QuickUser) => self.user = value.to_string(),
                 Some(Act::QuickIdentity) => self.identity = value.to_string(),
-                Some(Act::MacroName) => self.macro_name = value.to_string(),
-                Some(Act::MacroText) => self.macro_text = value.to_string(),
                 Some(Act::UploadPath) => {
                     if let Ok(mut shared) = self.shared.lock() {
                         shared.upload_path = value.to_string();
@@ -1160,35 +1428,6 @@ impl Root {
             return true;
         }
 
-        // 管理浮层里的会话 / 宏列表行：同样用具名槽位按索引解析。
-        if (self.sessions_open || self.macros_open)
-            && let Some(key) = command.node_key()
-        {
-            if self.sessions_open
-                && let Some(index) = (0..self.config.sessions.len())
-                    .find(|index| session_entry_key(owner, *index) == key)
-            {
-                self.session_selected = Some(index);
-                self.session_name = self.config.sessions[index].name.clone();
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
-            if self.macros_open
-                && let Some(index) = (0..self.config.macros.len())
-                    .find(|index| macro_entry_key(owner, *index) == key)
-            {
-                let entry = self.config.macros[index].clone();
-                self.macro_selected = Some(index);
-                self.macro_name = entry.name;
-                self.macro_text = entry.text;
-                self.macro_enter = entry.enter;
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
-        }
-
         // 快速连接会话行：单击选中，双击才连接。
         let quick_open = self.shared.lock().is_ok_and(|shared| shared.quick_open);
         if quick_open && let Some(key) = command.node_key() {
@@ -1347,200 +1586,6 @@ impl Root {
                 ctx.mark_dirty();
                 return true;
             }
-            // —— 会话管理 ——
-            Some(Act::SessionConnect) => {
-                let Some(index) = self.session_selected else {
-                    self.manager_notice = "请先在列表中选择一个会话".to_owned();
-                    ctx.mark_dirty();
-                    return true;
-                };
-                let Some(profile) = self.config.sessions.get(index).cloned() else {
-                    return true;
-                };
-                self.host = profile.host;
-                self.port = profile.port.to_string();
-                self.user = profile.user;
-                self.identity = profile.identity;
-                // 密码不落盘：载入后必须重新输入；有密钥路径时默认切到密钥模式。
-                self.password.clear();
-                self.auth = if self.identity.trim().is_empty() {
-                    0
-                } else {
-                    1
-                };
-                self.session_name = profile.name;
-                self.tab = 1;
-                self.shell_open = false;
-                self.sessions_open = false;
-                self.manager_notice.clear();
-                self.set_dialog(true);
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::SessionSave) => {
-                let name = self.session_name.trim().to_owned();
-                if name.is_empty() {
-                    self.manager_notice = "请先填写会话名称".to_owned();
-                } else {
-                    self.config.upsert_session(SessionProfile {
-                        name: name.clone(),
-                        host: self.host.trim().to_owned(),
-                        port: self.port.trim().parse().unwrap_or(22),
-                        user: self.user.trim().to_owned(),
-                        // 密码模式的密钥字段不落盘，避免载入后被误当成密钥登录。
-                        identity: if self.auth == 1 {
-                            self.identity.trim().to_owned()
-                        } else {
-                            String::new()
-                        },
-                    });
-                    self.session_selected = self
-                        .config
-                        .sessions
-                        .iter()
-                        .position(|session| session.name == name);
-                    self.manager_notice = match self.save_config() {
-                        Ok(()) => format!("已保存会话 {name}"),
-                        Err(err) => err,
-                    };
-                }
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::SessionDelete) => {
-                let Some(index) = self.session_selected else {
-                    self.manager_notice = "请先在列表中选择一个会话".to_owned();
-                    ctx.mark_dirty();
-                    return true;
-                };
-                let name = self
-                    .config
-                    .sessions
-                    .get(index)
-                    .map(|session| session.name.clone())
-                    .unwrap_or_default();
-                if self.config.remove_session(index) {
-                    self.session_selected = (!self.config.sessions.is_empty())
-                        .then(|| index.min(self.config.sessions.len() - 1));
-                    self.session_name.clear();
-                    self.manager_notice = match self.save_config() {
-                        Ok(()) => format!("已删除会话 {name}"),
-                        Err(err) => err,
-                    };
-                }
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::SessionClose) => {
-                self.sessions_open = false;
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
-            // —— 宏管理 ——
-            Some(Act::MacroEnter) => {
-                self.macro_enter = !self.macro_enter;
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::MacroNew) => {
-                self.macro_selected = None;
-                self.macro_name.clear();
-                self.macro_text.clear();
-                self.macro_enter = false;
-                self.manager_notice = "填写名称和内容后点保存".to_owned();
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::MacroSave) => {
-                let name = self.macro_name.trim().to_owned();
-                if name.is_empty() {
-                    self.manager_notice = "请先填写宏名称".to_owned();
-                } else {
-                    let entry = Macro {
-                        name: name.clone(),
-                        text: self.macro_text.clone(),
-                        enter: self.macro_enter,
-                    };
-                    if let Some(index) = self.macro_selected {
-                        self.config.replace_macro(index, entry);
-                    } else {
-                        self.config.upsert_macro(entry);
-                    }
-                    self.macro_selected = self
-                        .config
-                        .macros
-                        .iter()
-                        .position(|macros| macros.name == name);
-                    self.manager_notice = match self.save_config() {
-                        Ok(()) => format!("已保存宏 {name}"),
-                        Err(err) => err,
-                    };
-                }
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::MacroRun) => {
-                if self.macro_text.is_empty() {
-                    self.manager_notice = "宏内容为空".to_owned();
-                    ctx.mark_dirty();
-                    return true;
-                }
-                let (screen, input) = {
-                    let shared = self.shared.lock().expect("shared lock");
-                    (shared.screen, Arc::clone(&shared.input))
-                };
-                if screen != Screen::Session {
-                    self.manager_notice = "宏只能在已连接的会话中运行".to_owned();
-                    ctx.mark_dirty();
-                    return true;
-                }
-                let bytes = macro_bytes(&self.macro_text, self.macro_enter);
-                let sent = input.lock().is_ok_and(|slot| {
-                    slot.as_ref()
-                        .is_some_and(|sender| sender.send(UiEvent::Input(bytes)).is_ok())
-                });
-                if sent {
-                    self.macros_open = false;
-                    self.manager_notice.clear();
-                } else {
-                    self.manager_notice = "发送失败：当前没有输入通道".to_owned();
-                }
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::MacroDelete) => {
-                let Some(index) = self.macro_selected else {
-                    self.manager_notice = "请先在列表中选择一个宏".to_owned();
-                    ctx.mark_dirty();
-                    return true;
-                };
-                let name = self
-                    .config
-                    .macros
-                    .get(index)
-                    .map(|entry| entry.name.clone())
-                    .unwrap_or_default();
-                if self.config.remove_macro(index) {
-                    self.macro_selected = (!self.config.macros.is_empty())
-                        .then(|| index.min(self.config.macros.len() - 1));
-                    self.macro_name.clear();
-                    self.macro_text.clear();
-                    self.macro_enter = false;
-                    self.manager_notice = match self.save_config() {
-                        Ok(()) => format!("已删除宏 {name}"),
-                        Err(err) => err,
-                    };
-                }
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::MacroClose) => {
-                self.macros_open = false;
-                self.manager_notice.clear();
-                ctx.mark_dirty();
-                return true;
-            }
             // —— 快速连接侧边栏 ——
             Some(Act::QuickNew) => {
                 self.quick_editing = true;
@@ -1649,7 +1694,12 @@ impl Root {
             rows.push(self.quick_row(theme, index, profile));
         }
         if rows.is_empty() {
-            rows.push(self.manager_hint(theme, "还没有保存的连接，点「新建」添加"));
+            rows.push(
+                Label::new("还没有保存的连接，点「新建」添加")
+                    .size(12.0)
+                    .color(theme.text(TextToken::Secondary))
+                    .view(theme),
+            );
         }
         children.push(Scroll::new().grow(1.0).view(theme).with_children(rows));
 
@@ -1968,179 +2018,6 @@ impl Root {
             .gap(6.0)
             .view(theme)
             .with_children(children)
-    }
-
-    /// 已保存会话管理浮层：列表选择 + 名称 + 连接 / 保存当前 / 删除 / 关闭。
-    fn session_manager(&self, owner: NodeKey, theme: &UiTheme) -> OverlayView {
-        let mut rows = Vec::new();
-        for (index, profile) in self.config.sessions.iter().enumerate().take(100) {
-            let target = if profile.user.is_empty() {
-                format!("{}  {}:{}", profile.name, profile.host, profile.port)
-            } else {
-                format!(
-                    "{}  {}@{}:{}",
-                    profile.name, profile.user, profile.host, profile.port
-                )
-            };
-            rows.push(self.manager_row(
-                theme,
-                SESSION_ENTRY_BASE + index as LocalKey,
-                self.session_selected == Some(index),
-                target,
-            ));
-        }
-        if rows.is_empty() {
-            rows.push(self.manager_hint(theme, "还没有保存的会话"));
-        }
-
-        let content = Column::new().gap(10.0).view(theme).with_children([
-            Row::new().gap(8.0).view(theme).with_children([
-                Label::new("名称").view(theme),
-                TextField::new(self.session_name.clone())
-                    .width(340.0)
-                    .with_key(Act::SessionName)
-                    .view(theme),
-            ]),
-            Scroll::new().height(200.0).view(theme).with_children(rows),
-            Label::new("保存当前：把上方 SSH 表单里的主机 / 端口 / 用户 / 密钥写进配置")
-                .size(12.0)
-                .color(theme.text(TextToken::Secondary))
-                .view(theme),
-            self.manager_notice_view(theme),
-        ]);
-
-        Dialog::new("已保存会话")
-            .key(child_key(owner, SESSIONS_SLOT))
-            .width(520.0)
-            .content(content)
-            .actions([
-                Button::new("连接")
-                    .with_key(Act::SessionConnect)
-                    .view(theme),
-                Button::new("保存当前")
-                    .with_key(Act::SessionSave)
-                    .view(theme),
-                Button::new("删除选中")
-                    .with_key(Act::SessionDelete)
-                    .view(theme),
-                Button::new("关闭").with_key(Act::SessionClose).view(theme),
-            ])
-            .build(owner, theme)
-    }
-
-    /// 宏管理浮层：列表选择 + 名称 / 内容 / 回车开关 + 新建 / 保存 / 运行 / 删除 / 关闭。
-    fn macro_manager(&self, owner: NodeKey, theme: &UiTheme) -> OverlayView {
-        let mut rows = Vec::new();
-        for (index, entry) in self.config.macros.iter().enumerate().take(100) {
-            let inline = entry.text.replace(['\n', '\r'], " ");
-            let preview: String = inline.chars().take(36).collect();
-            let suffix = if entry.enter { "  ↵" } else { "" };
-            rows.push(self.manager_row(
-                theme,
-                MACRO_ENTRY_BASE + index as LocalKey,
-                self.macro_selected == Some(index),
-                format!("{}  {}{}", entry.name, preview, suffix),
-            ));
-        }
-        if rows.is_empty() {
-            rows.push(self.manager_hint(theme, "还没有宏，点「新建」开始"));
-        }
-
-        let content = Column::new().gap(10.0).view(theme).with_children([
-            Row::new().gap(8.0).view(theme).with_children([
-                Label::new("名称").view(theme),
-                TextField::new(self.macro_name.clone())
-                    .width(340.0)
-                    .with_key(Act::MacroName)
-                    .view(theme),
-            ]),
-            Row::new().gap(8.0).view(theme).with_children([
-                Label::new("内容").view(theme),
-                TextField::new(self.macro_text.clone())
-                    .width(340.0)
-                    .with_key(Act::MacroText)
-                    .view(theme),
-            ]),
-            Row::new().gap(8.0).view(theme).with_children([
-                Button::new(if self.macro_enter {
-                    "自动回车：开"
-                } else {
-                    "自动回车：关"
-                })
-                .with_key(Act::MacroEnter)
-                .view(theme),
-                Label::new("支持 \\n \\r \\t \\e \\xNN 转义")
-                    .size(12.0)
-                    .color(theme.text(TextToken::Secondary))
-                    .view(theme),
-            ]),
-            Scroll::new().height(180.0).view(theme).with_children(rows),
-            self.manager_notice_view(theme),
-        ]);
-
-        Dialog::new("宏")
-            .key(child_key(owner, MACROS_SLOT))
-            .width(520.0)
-            .content(content)
-            .actions([
-                Button::new("新建").with_key(Act::MacroNew).view(theme),
-                Button::new("保存").with_key(Act::MacroSave).view(theme),
-                Button::new("运行").with_key(Act::MacroRun).view(theme),
-                Button::new("删除选中")
-                    .with_key(Act::MacroDelete)
-                    .view(theme),
-                Button::new("关闭").with_key(Act::MacroClose).view(theme),
-            ])
-            .build(owner, theme)
-    }
-
-    /// 管理浮层里的一行（选中态 / 悬停态与 SFTP 目录项一致）。
-    fn manager_row(
-        &self,
-        theme: &UiTheme,
-        slot: LocalKey,
-        selected: bool,
-        text: String,
-    ) -> ViewNode {
-        let mut style = Style::default();
-        style.layout.direction = FlexDirection::Row;
-        style.layout.align_items = AlignItems::Center;
-        style.layout.height = Length::px(22.0);
-        style.layout.padding = Edges::new(0.0, 6.0, 0.0, 6.0);
-        style.visual.cursor = Cursor::Pointer;
-        style.visual.background = if selected {
-            theme.brand(Shade::Base)
-        } else {
-            Color::TRANSPARENT
-        };
-        if selected {
-            style.visual.color = Color::WHITE;
-        } else {
-            style.visual = style.visual.with_override(
-                InteractionState::Hovered,
-                VisualOverrides {
-                    background: Some(theme.bg(BgToken::ContainerHover)),
-                    ..VisualOverrides::default()
-                },
-            );
-        }
-        ViewNode::new(Decl::div(child_key(ROOT_KEY, slot)).with_style(style))
-            .with_slot(Some(slot))
-            .child(passthrough(Label::new(text).size(12.0).view(theme)))
-    }
-
-    fn manager_hint(&self, theme: &UiTheme, text: &str) -> ViewNode {
-        Label::new(text)
-            .size(12.0)
-            .color(theme.text(TextToken::Secondary))
-            .view(theme)
-    }
-
-    fn manager_notice_view(&self, theme: &UiTheme) -> ViewNode {
-        Label::new(self.manager_notice.clone())
-            .size(12.0)
-            .color(theme.text(TextToken::Secondary))
-            .view(theme)
     }
 
     /// 连接参数：终端与 SFTP 都用它，避免两边字段不一致。
@@ -2495,7 +2372,6 @@ impl Root {
                 .view(theme)])
     }
 
-
     /// rz 上传：远端请求接收文件时让用户填写本地路径。
     fn upload_dialog(
         &self,
@@ -2579,12 +2455,12 @@ fn sftp_entry_key(owner: NodeKey, index: usize) -> NodeKey {
 }
 
 /// 会话管理列表第 `index` 行的声明 key。
-fn session_entry_key(owner: NodeKey, index: usize) -> NodeKey {
+pub(crate) fn session_entry_key(owner: NodeKey, index: usize) -> NodeKey {
     child_key(owner, SESSION_ENTRY_BASE + index as LocalKey)
 }
 
 /// 宏管理列表第 `index` 行的声明 key。
-fn macro_entry_key(owner: NodeKey, index: usize) -> NodeKey {
+pub(crate) fn macro_entry_key(owner: NodeKey, index: usize) -> NodeKey {
     child_key(owner, MACRO_ENTRY_BASE + index as LocalKey)
 }
 
@@ -3201,7 +3077,6 @@ impl AppHandler for LietermApp {
         let root = Root {
             shared: Arc::clone(&self.shared),
             actions: self.actions_tx.clone(),
-            form_snapshot: Arc::new(Mutex::new(ConnectForm::default())),
             host: String::new(),
             port: "22".to_owned(),
             user: String::new(),

@@ -1,9 +1,10 @@
 mod app;
-mod connect_host;
 mod config;
+mod connect_host;
 mod keys;
 mod known_hosts;
 mod local;
+mod manager_host;
 mod sftp;
 mod ssh;
 mod ssh_config;

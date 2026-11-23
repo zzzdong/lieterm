@@ -1,6 +1,7 @@
 //! 声明结构测试：不连 SSH，也能确认对话框 / 菜单栏 / 会话页的关键节点都在声明树里。
 
 use super::*;
+use crate::manager_host::ManagerHost;
 
 fn root_with(screen: Screen, status: &str, dialog: bool) -> Root {
     let shared = Arc::new(Mutex::new(Shared {
@@ -15,7 +16,6 @@ fn root_with(screen: Screen, status: &str, dialog: bool) -> Root {
     Root {
         shared,
         actions,
-        form_snapshot: Arc::new(Mutex::new(ConnectForm::default())),
         host: String::new(),
         port: "22".to_owned(),
         user: String::new(),
@@ -248,8 +248,10 @@ fn session_manager_lists_saved_profiles() {
         identity: String::new(),
     });
     root.sessions_open = true;
+    let mut host = ManagerHost::new();
+    host.set_props(&root.manager_props());
 
-    let overlays = root.overlays(7, &UiTheme::default());
+    let overlays = host.overlays(7, &UiTheme::default());
     assert_eq!(overlays.len(), 1, "会话管理浮层打开时不再叠加其它浮层");
     assert!(overlays[0].spec.is_modal(), "会话管理是模态对话框");
     for label in [
@@ -267,6 +269,28 @@ fn session_manager_lists_saved_profiles() {
 }
 
 #[test]
+fn manager_overlays_are_declared_by_the_mounted_host() {
+    let mut root = root_with(Screen::Idle, "", false);
+    root.config.upsert_session(SessionProfile {
+        name: "prod".to_owned(),
+        host: "10.0.0.1".to_owned(),
+        port: 2222,
+        user: "deploy".to_owned(),
+        identity: String::new(),
+    });
+    root.sessions_open = true;
+
+    let tree = mounted_view(root);
+    let dialog = tree
+        .overlays
+        .iter()
+        .find(|overlay| has_text(&overlay.content, "已保存会话"))
+        .expect("管理浮层由 ManagerHost 子组件声明");
+    assert!(dialog.spec.is_modal());
+    assert!(has_text(&dialog.content, "deploy@10.0.0.1:2222"));
+}
+
+#[test]
 fn macro_manager_lists_macros_and_enter_state() {
     let mut root = root_with(Screen::Session, "", false);
     root.config.upsert_macro(Macro {
@@ -280,13 +304,53 @@ fn macro_manager_lists_macros_and_enter_state() {
     root.macro_name = "磁盘".to_owned();
     root.macro_text = "df -h".to_owned();
     root.macro_enter = true;
+    let mut host = ManagerHost::new();
+    host.set_props(&root.manager_props());
 
-    let overlays = root.overlays(7, &UiTheme::default());
+    let overlays = host.overlays(7, &UiTheme::default());
     assert_eq!(overlays.len(), 1);
     assert!(overlays[0].spec.is_modal());
     for label in ["宏", "磁盘", "df -h", "自动回车：开", "运行"] {
         assert!(has_text(&overlays[0].content, label), "宏管理缺少 {label}");
     }
+}
+
+#[test]
+fn manager_host_reports_row_selection_to_root() {
+    let mut root = root_with(Screen::Idle, "", false);
+    root.config.upsert_session(SessionProfile {
+        name: "prod".to_owned(),
+        host: "10.0.0.1".to_owned(),
+        port: 2222,
+        user: "deploy".to_owned(),
+        identity: String::new(),
+    });
+    root.sessions_open = true;
+
+    let mut host = ManagerHost::new();
+    host.set_props(&root.manager_props());
+    let click = RawCommand::Click {
+        target: zzzui::element::WidgetId::null(),
+        key: Some(session_entry_key(7, 0)),
+    };
+    let mut host_ctx = UpdateCtx::test();
+    assert!(
+        host.on_command(7, &click, &mut host_ctx),
+        "子组件认领列表行点击"
+    );
+
+    let select = zzzui::element::CustomEvent::new(crate::manager_host::ManagerEvent::Select {
+        kind: crate::manager_host::ManagerKind::Sessions,
+        index: 0,
+    });
+    let emit = RawCommand::Emit {
+        target: zzzui::element::WidgetId::null(),
+        event: select,
+    };
+    let mut ctx = UpdateCtx::test();
+    assert!(root.on_command(7, &emit, &mut ctx));
+    assert_eq!(root.session_selected, Some(0));
+    assert_eq!(root.session_name, "prod");
 }
 
 #[test]
@@ -338,10 +402,6 @@ fn geometry_hittest_excludes_the_sidebars() {
 
 #[test]
 fn clicking_ssh_tab_switches_without_connecting_a_local_shell() {
-    fn has_key(node: &ViewNode, key: NodeKey) -> bool {
-        node.decl.key() == key || node.children.iter().any(|child| has_key(child, key))
-    }
-
     let tree = mounted_view(root_with(Screen::Idle, "", true));
     let dialog = tree
         .overlays
@@ -365,15 +425,18 @@ fn clicking_ssh_tab_switches_without_connecting_a_local_shell() {
 
     // 点击由 ConnectHost 认领，并上报 Choice{Tabs,1} 给 Root。
     let root = root_with(Screen::Idle, "", true);
-    let form_snapshot = Arc::clone(&root.form_snapshot);
     let shared = Arc::clone(&root.shared);
     let click = RawCommand::Click {
         target: zzzui::element::WidgetId::null(),
         key: Some(ssh_text_key),
     };
-    let mut host = crate::connect_host::ConnectHost::new(form_snapshot);
+    let mut host = crate::connect_host::ConnectHost::new();
+    host.set_props(&root.connect_props());
     let mut host_ctx = UpdateCtx::test();
-    assert!(host.on_command(dialog.owner, &click, &mut host_ctx), "子组件认领标签点击");
+    assert!(
+        host.on_command(dialog.owner, &click, &mut host_ctx),
+        "子组件认领标签点击"
+    );
 
     // Root 认领事件后切换标签，且不得触发连接。
     let choice = zzzui::element::CustomEvent::new(crate::connect_host::Choice {

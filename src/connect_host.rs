@@ -1,10 +1,10 @@
 //! 连接对话框子组件：自己声明浮层、处理浮层内命令，通过事件把业务动作上报给 Root。
 //!
-//! Root 仍是表单状态的真相源，每帧把状态同步到 `form` 快照供本组件渲染；浮层里的
-//! 点击 / 输入由本组件认领后 `emit` 给 Root。这样浮层归属、命令路由都在子组件里，
+//! Root 仍是表单状态的真相源，每次重建声明时通过 `ChildDecl::props` 下发 `ConnectForm`；
+//! 浮层里的点击 / 输入由本组件认领后 `emit` 给 Root。这样浮层归属、命令路由都在子组件里，
 //! 而业务状态不需要跨组件复制多份。
 
-use std::sync::{Arc, Mutex};
+use std::any::Any;
 
 use zzzui::{
     element::{
@@ -20,7 +20,7 @@ use zzzui::{
 };
 
 use crate::app::{
-    AUTH_OPTIONS, Act, AUTH_POPUP_SLOT, ConnectForm, DIALOG_SLOT, FIELD_WIDTH, LABEL_WIDTH,
+    AUTH_OPTIONS, AUTH_POPUP_SLOT, Act, ConnectForm, DIALOG_SLOT, FIELD_WIDTH, LABEL_WIDTH,
     SHELL_POPUP_SLOT,
 };
 
@@ -58,14 +58,16 @@ fn passthrough(mut node: ViewNode) -> ViewNode {
     node
 }
 
-/// 连接对话框宿主；`form` 是 Root 每帧同步进来的只读快照。
+/// 连接对话框宿主；`form` 是 Root 每次重建时通过 props 下发的只读参数。
 pub struct ConnectHost {
-    form: Arc<Mutex<ConnectForm>>,
+    form: ConnectForm,
 }
 
 impl ConnectHost {
-    pub fn new(form: Arc<Mutex<ConnectForm>>) -> Self {
-        Self { form }
+    pub fn new() -> Self {
+        Self {
+            form: ConnectForm::default(),
+        }
     }
 
     fn select_field(
@@ -172,7 +174,13 @@ impl ConnectHost {
                 ]),
                 Row::new().gap(8.0).view(theme).with_children([
                     Self::form_label("认证方式", theme),
-                    self.select_field(theme, Act::AuthMode, AUTH_OPTIONS, form.auth, form.auth_open),
+                    self.select_field(
+                        theme,
+                        Act::AuthMode,
+                        AUTH_OPTIONS,
+                        form.auth,
+                        form.auth_open,
+                    ),
                 ]),
             ];
             if form.auth == 0 {
@@ -236,6 +244,12 @@ impl ConnectHost {
     }
 }
 
+impl Default for ConnectHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Widget for ConnectHost {
     fn view(&self, _theme: &UiTheme) -> ViewNode {
         let mut style = Style::default();
@@ -244,12 +258,18 @@ impl Widget for ConnectHost {
         ViewNode::new(Decl::div(ROOT_KEY).with_style(style))
     }
 
+    fn set_props(&mut self, props: &dyn Any) {
+        if let Some(form) = props.downcast_ref::<ConnectForm>() {
+            self.form = form.clone();
+        }
+    }
+
     fn overlays(&self, owner: NodeKey, theme: &UiTheme) -> Vec<OverlayView> {
-        let form = self.form.lock().expect("form lock");
+        let form = &self.form;
         if !form.dialog_open {
             return Vec::new();
         }
-        let mut out = vec![self.dialog(owner, theme, &form)];
+        let mut out = vec![self.dialog(owner, theme, form)];
         if form.shell_open {
             let shells: Vec<&str> = form.shells.iter().map(|(name, _)| name.as_str()).collect();
             out.push(
@@ -277,17 +297,23 @@ impl Widget for ConnectHost {
     fn on_command(&mut self, owner: NodeKey, command: &RawCommand, ctx: &mut UpdateCtx) -> bool {
         // 关闭请求：对话框 / 两个下拉。
         if let RawCommand::OverlayDismiss { key, .. } = command {
-            let form = self.form.lock().expect("form lock");
+            let form = &self.form;
             if *key == child_key(owner, DIALOG_SLOT) {
                 ctx.emit(CloseDialog);
                 return true;
             }
             if *key == child_key(owner, SHELL_POPUP_SLOT) && form.shell_open {
-                ctx.emit(Choice { act: Act::Shell, index: form.shell });
+                ctx.emit(Choice {
+                    act: Act::Shell,
+                    index: form.shell,
+                });
                 return true;
             }
             if *key == child_key(owner, AUTH_POPUP_SLOT) && form.auth_open {
-                ctx.emit(Choice { act: Act::AuthMode, index: form.auth });
+                ctx.emit(Choice {
+                    act: Act::AuthMode,
+                    index: form.auth,
+                });
                 return true;
             }
             return false;
@@ -299,24 +325,41 @@ impl Widget for ConnectHost {
                 Some(a @ (Act::Host | Act::Port | Act::User | Act::Password | Act::Identity)) => a,
                 _ => return false,
             };
-            ctx.emit(FormEdit { act, value: value.to_string() });
+            ctx.emit(FormEdit {
+                act,
+                value: value.to_string(),
+            });
             return true;
         }
 
         // 菜单选中
-        let shell_len = self.form.lock().expect("form lock").shells.len();
-        if let Some(index) = Menu::selection(child_key(owner, SHELL_POPUP_SLOT), shell_len, command) {
-            ctx.emit(Choice { act: Act::Shell, index });
+        let shell_len = self.form.shells.len();
+        if let Some(index) = Menu::selection(child_key(owner, SHELL_POPUP_SLOT), shell_len, command)
+        {
+            ctx.emit(Choice {
+                act: Act::Shell,
+                index,
+            });
             return true;
         }
-        if let Some(index) = Menu::selection(child_key(owner, AUTH_POPUP_SLOT), AUTH_OPTIONS.len(), command) {
-            ctx.emit(Choice { act: Act::AuthMode, index });
+        if let Some(index) = Menu::selection(
+            child_key(owner, AUTH_POPUP_SLOT),
+            AUTH_OPTIONS.len(),
+            command,
+        ) {
+            ctx.emit(Choice {
+                act: Act::AuthMode,
+                index,
+            });
             return true;
         }
 
         // Tabs
         if let Some(index) = Tabs::selection(child_key(owner, Act::Tabs.local()), 2, command) {
-            ctx.emit(Choice { act: Act::Tabs, index });
+            ctx.emit(Choice {
+                act: Act::Tabs,
+                index,
+            });
             return true;
         }
 
