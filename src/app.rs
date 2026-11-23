@@ -19,8 +19,8 @@ use zzzui::{
     platform::{AppHandler, WindowContext, WindowId, WindowOpener},
     view::{OverlayView, ViewNode},
     widget::{
-        BgToken, BorderToken, Button, Center, Column, Dialog, Family, Key, KeyCapture, Label, Menu,
-        RadiusToken, Row, Scroll, Shade, Tabs, TextField, TextToken, UiTheme, UpdateCtx, Widget,
+        BgToken, BorderToken, Button, Center, Column, Dialog, Key, KeyCapture, Label, Menu,
+        RadiusToken, Row, Scroll, Shade, TextField, TextToken, UiTheme, UpdateCtx, Widget,
     },
 };
 
@@ -39,15 +39,15 @@ const MENUBAR_HEIGHT: f64 = 28.0;
 /// 会话标签栏高度（zzzui `Tabs` 用 `Comp(ControlHeight::Xxl)` = 48）。
 const TAB_BAR_HEIGHT: f64 = 48.0;
 /// 声明槽位：对话框 / 菜单栏根 / 菜单浮层 / shell 下拉 / 标签栏。
-const DIALOG_SLOT: LocalKey = 900;
+pub(crate) const DIALOG_SLOT: LocalKey = 900;
 const MENUBAR_SLOT: LocalKey = 901;
 const MENU_POPUP_BASE: LocalKey = 910;
-const SHELL_POPUP_SLOT: LocalKey = 920;
+pub(crate) const SHELL_POPUP_SLOT: LocalKey = 920;
 /// SSH 认证方式下拉的浮层槽位。
-const AUTH_POPUP_SLOT: LocalKey = 921;
+pub(crate) const AUTH_POPUP_SLOT: LocalKey = 921;
 /// 连接对话框里输入框 / 下拉框的统一宽度，以及标签列宽度。
-const FIELD_WIDTH: f64 = 300.0;
-const LABEL_WIDTH: f64 = 72.0;
+pub(crate) const FIELD_WIDTH: f64 = 300.0;
+pub(crate) const LABEL_WIDTH: f64 = 72.0;
 const TAB_BAR_SLOT: LocalKey = 970;
 /// 标签栏内每个标签占 2 个槽位（选中 / 关闭）；标签右键菜单。
 const TAB_ENTRY_BASE: LocalKey = 2000;
@@ -69,7 +69,7 @@ const CONTEXT_SLOT: LocalKey = 980;
 const UPLOAD_SLOT: LocalKey = 981;
 
 /// SSH 认证方式下拉选项：0 = 密码，1 = 密钥。
-const AUTH_OPTIONS: &[&str] = &["密码", "密钥"];
+pub(crate) const AUTH_OPTIONS: &[&str] = &["密码", "密钥"];
 
 /// 菜单栏定义：(标题, 选项)。选项序号与 `on_menu` 的分支一一对应。
 const MENUS: &[(&str, &[&str])] = &[
@@ -158,7 +158,13 @@ impl Geometry {
 }
 
 zzzui::key_enum! {
-    enum Act {
+    enum DialogHostKey {
+        Connect,
+    }
+}
+
+zzzui::key_enum! {
+    pub(crate) enum Act {
         Host,
         Port,
         User,
@@ -170,6 +176,7 @@ zzzui::key_enum! {
         Shell,
         MenuFile,
         MenuSession,
+        MenuTerminal,
         MenuHelp,
         Identity,
         SftpPath,
@@ -387,6 +394,45 @@ pub struct Shared {
     pub transfer_active: bool,
 }
 
+/// 连接对话框的表单状态：Root（快速连接 / 会话管理）与 ConnectHost 共享。
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectForm {
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub password: String,
+    pub identity: String,
+    pub auth: usize,
+    pub tab: usize,
+    pub shell: usize,
+    pub shells: Vec<(String, String)>,
+    pub dialog_open: bool,
+    pub shell_open: bool,
+    pub auth_open: bool,
+    /// 失败原因（仅连接失败后重新打开时展示）。
+    pub failure: Option<String>,
+}
+
+impl Default for ConnectForm {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: "22".to_owned(),
+            user: String::new(),
+            password: String::new(),
+            identity: String::new(),
+            auth: 0,
+            tab: 0,
+            shell: 0,
+            shells: local::available_shells(),
+            dialog_open: true,
+            shell_open: false,
+            auth_open: false,
+            failure: None,
+        }
+    }
+}
+
 impl Default for Shared {
     fn default() -> Self {
         Self {
@@ -455,6 +501,8 @@ impl Bridge {
 struct Root {
     shared: Arc<Mutex<Shared>>,
     actions: std_mpsc::Sender<UiAction>,
+    /// 给 ConnectHost 的只读快照，每帧从本组件的字段同步。
+    form_snapshot: Arc<Mutex<ConnectForm>>,
 
     host: String,
     port: String,
@@ -506,7 +554,19 @@ struct Root {
 }
 
 impl Widget for Root {
+    /// 连接对话框是独立子组件：自己声明浮层、认领浮层内命令，再以事件上报。
+    fn children(&self) -> Vec<zzzui::widget::ChildDecl> {
+        vec![zzzui::widget::ChildDecl::new(
+            DialogHostKey::Connect,
+            {
+                let form = Arc::clone(&self.form_snapshot);
+                move || Box::new(crate::connect_host::ConnectHost::new(Arc::clone(&form)))
+            },
+        )]
+    }
+
     fn view(&self, theme: &UiTheme) -> ViewNode {
+        self.sync_form();
         let shared = self.shared.lock().expect("shared lock");
         let width = shared.width.max(1.0);
         let height = shared.height.max(1.0);
@@ -596,16 +656,13 @@ impl Widget for Root {
     }
 
     fn overlays(&self, owner: NodeKey, theme: &UiTheme) -> Vec<OverlayView> {
+        self.sync_form();
         let shared = self.shared.lock().expect("shared lock");
-        // 管理浮层打开时先收起连接对话框，关闭管理后对话框自动回来。
-        let dialog_open = shared.dialog_open && !self.sessions_open && !self.macros_open;
+        // 连接对话框与 shell/auth 下拉已交给 ConnectHost 子组件声明。
         let upload = shared
             .upload_open
             .then(|| (shared.upload_path.clone(), shared.upload_notice.clone()));
         let mut out = Vec::new();
-        if dialog_open {
-            out.push(self.dialog(owner, theme, &shared));
-        }
         drop(shared);
 
         if let Some((path, notice)) = upload {
@@ -626,28 +683,6 @@ impl Widget for Root {
                     .anchored(menu_title_key(owner, index))
                     .key(child_key(owner, MENU_POPUP_BASE + index as LocalKey))
                     .width(180.0)
-                    .build(owner, theme),
-            );
-        }
-
-        if self.shell_open && dialog_open {
-            out.push(
-                Menu::new(self.shells.iter().map(|(name, _)| name.as_str()))
-                    .anchored(child_key(owner, Act::Shell.local()))
-                    .key(child_key(owner, SHELL_POPUP_SLOT))
-                    .selected(self.shell)
-                    .width(FIELD_WIDTH)
-                    .build(owner, theme),
-            );
-        }
-
-        if self.auth_open && dialog_open && self.tab == 1 {
-            out.push(
-                Menu::new(AUTH_OPTIONS.iter().copied())
-                    .anchored(child_key(owner, Act::AuthMode.local()))
-                    .key(child_key(owner, AUTH_POPUP_SLOT))
-                    .selected(self.auth)
-                    .width(FIELD_WIDTH)
                     .build(owner, theme),
             );
         }
@@ -706,12 +741,103 @@ impl Widget for Root {
     }
 }
 impl Root {
+    /// 把当前表单字段写进快照，供 ConnectHost 声明浮层时读取。
+    fn sync_form(&self) {
+        let shared = self.shared.lock().expect("shared lock");
+        if let Ok(mut form) = self.form_snapshot.lock() {
+            form.host = self.host.clone();
+            form.port = self.port.clone();
+            form.user = self.user.clone();
+            form.password = self.password.clone();
+            form.identity = self.identity.clone();
+            form.auth = self.auth;
+            form.tab = self.tab;
+            form.shell = self.shell;
+            form.shells = self.shells.clone();
+            form.dialog_open = shared.dialog_open && !self.sessions_open && !self.macros_open;
+            form.shell_open = self.shell_open;
+            form.auth_open = self.auth_open;
+            form.failure = (shared.screen == Screen::Failed && !shared.label.is_empty())
+                .then(|| shared.label.clone());
+        }
+    }
+
+    /// 认领 ConnectHost 上报的事件：业务状态仍由 Root 维护。
+    fn on_dialog_event(&mut self, command: &RawCommand, ctx: &mut UpdateCtx) -> bool {
+        use crate::connect_host::{Choice, CloseDialog, ConnectRequested, FormEdit, Toggle};
+
+        if let Some(FormEdit { act, value }) = command.event::<FormEdit>() {
+            match *act {
+                Act::Host => self.host = value.clone(),
+                Act::Port => self.port = value.clone(),
+                Act::User => self.user = value.clone(),
+                Act::Password => self.password = value.clone(),
+                Act::Identity => self.identity = value.clone(),
+                _ => return false,
+            }
+            ctx.mark_dirty();
+            return true;
+        }
+        if command.is_event::<CloseDialog>() {
+            self.set_dialog(false);
+            self.shell_open = false;
+            self.auth_open = false;
+            ctx.mark_dirty();
+            return true;
+        }
+        if command.is_event::<ConnectRequested>() {
+            self.connect(ctx);
+            return true;
+        }
+        if let Some(Toggle { act }) = command.event::<Toggle>() {
+            match *act {
+                Act::Shell => {
+                    self.shell_open = !self.shell_open;
+                    self.auth_open = false;
+                }
+                Act::AuthMode => {
+                    self.auth_open = !self.auth_open;
+                    self.shell_open = false;
+                }
+                _ => return false,
+            }
+            ctx.mark_dirty();
+            return true;
+        }
+        if let Some(Choice { act, index }) = command.event::<Choice>() {
+            match *act {
+                Act::Shell => {
+                    self.shell = *index;
+                    self.shell_open = false;
+                }
+                Act::AuthMode => {
+                    self.auth = *index;
+                    self.auth_open = false;
+                }
+                Act::Tabs => {
+                    self.tab = *index;
+                    self.shell_open = false;
+                    self.auth_open = false;
+                }
+                _ => return false,
+            }
+            ctx.mark_dirty();
+            return true;
+        }
+        false
+    }
+
     fn on_command_inner(
         &mut self,
         owner: NodeKey,
         command: &RawCommand,
         ctx: &mut UpdateCtx,
     ) -> bool {
+        // 0. ConnectHost 上报的对话框事件（浮层命令已由子组件认领）。
+        if self.on_dialog_event(command, ctx) {
+            return true;
+        }
+
         // 1. 浮层关闭请求：对话框 / 管理浮层 / 菜单栏下拉 / shell 下拉各自只关自己。
         if let RawCommand::OverlayDismiss { key, .. } = command {
             if self.sessions_open && *key == child_key(owner, SESSIONS_SLOT) {
@@ -746,23 +872,6 @@ impl Root {
                 ctx.mark_dirty();
                 return true;
             }
-            if *key == child_key(owner, DIALOG_SLOT) {
-                self.set_dialog(false);
-                self.shell_open = false;
-                self.auth_open = false;
-                ctx.mark_dirty();
-                return true;
-            }
-            if self.shell_open && *key == child_key(owner, SHELL_POPUP_SLOT) {
-                self.shell_open = false;
-                ctx.mark_dirty();
-                return true;
-            }
-            if self.auth_open && *key == child_key(owner, AUTH_POPUP_SLOT) {
-                self.auth_open = false;
-                ctx.mark_dirty();
-                return true;
-            }
             if let Some(index) = self.open_menu
                 && *key == child_key(owner, MENU_POPUP_BASE + index as LocalKey)
             {
@@ -775,11 +884,6 @@ impl Root {
         // 2. 文本输入（对话框里的 SSH 字段）。
         if let RawCommand::TextChanged { value, .. } = command {
             match command.key::<Act>(owner) {
-                Some(Act::Host) => self.host = value.to_string(),
-                Some(Act::Port) => self.port = value.to_string(),
-                Some(Act::User) => self.user = value.to_string(),
-                Some(Act::Password) => self.password = value.to_string(),
-                Some(Act::Identity) => self.identity = value.to_string(),
                 Some(Act::SftpPath) => {
                     if let Ok(mut shared) = self.shared.lock() {
                         shared.sftp.path = value.to_string();
@@ -1118,33 +1222,7 @@ impl Root {
             }
         }
 
-        // 4. shell / 认证方式下拉选项。
-        if self.shell_open
-            && let Some(index) = Menu::selection(
-                child_key(owner, SHELL_POPUP_SLOT),
-                self.shells.len(),
-                command,
-            )
-        {
-            self.shell = index;
-            self.shell_open = false;
-            ctx.mark_dirty();
-            return true;
-        }
-        if self.auth_open
-            && let Some(index) = Menu::selection(
-                child_key(owner, AUTH_POPUP_SLOT),
-                AUTH_OPTIONS.len(),
-                command,
-            )
-        {
-            self.auth = index;
-            self.auth_open = false;
-            ctx.mark_dirty();
-            return true;
-        }
-
-        // 5. 菜单栏标题。
+        // 4. 菜单栏标题。
         match command.key::<Act>(owner) {
             Some(Act::MenuFile) => {
                 self.open_menu = (self.open_menu != Some(0)).then_some(0);
@@ -1158,8 +1236,14 @@ impl Root {
                 ctx.mark_dirty();
                 return true;
             }
-            Some(Act::MenuHelp) => {
+            Some(Act::MenuTerminal) => {
                 self.open_menu = (self.open_menu != Some(2)).then_some(2);
+                self.shell_open = false;
+                ctx.mark_dirty();
+                return true;
+            }
+            Some(Act::MenuHelp) => {
+                self.open_menu = (self.open_menu != Some(3)).then_some(3);
                 self.shell_open = false;
                 ctx.mark_dirty();
                 return true;
@@ -1167,41 +1251,8 @@ impl Root {
             _ => {}
         }
 
-        // 6. 对话框：选项卡 / 认证方式 / shell 按钮 / 连接 / 取消。
-        if let Some(index) = Tabs::selection(child_key(owner, Act::Tabs.local()), 2, command) {
-            self.tab = index;
-            self.shell_open = false;
-            self.auth_open = false;
-            ctx.mark_dirty();
-            return true;
-        }
+        // 5. 对话框命令由 ConnectHost 认领；这里只处理标签栏「+」。
         match command.key::<Act>(owner) {
-            Some(Act::Shell) => {
-                self.shell_open = !self.shell_open;
-                self.auth_open = false;
-                self.open_menu = None;
-                ctx.mark_dirty();
-                return true;
-            }
-            // 认证方式用下拉选择，和 shell 选择一样由外层声明浮层。
-            Some(Act::AuthMode) => {
-                self.auth_open = !self.auth_open;
-                self.shell_open = false;
-                self.open_menu = None;
-                ctx.mark_dirty();
-                return true;
-            }
-            Some(Act::Connect) => {
-                self.connect(ctx);
-                return true;
-            }
-            Some(Act::Cancel) => {
-                self.set_dialog(false);
-                self.shell_open = false;
-                self.auth_open = false;
-                ctx.mark_dirty();
-                return true;
-            }
             // 标签栏右侧的「+」：打开连接对话框，建新标签。
             Some(Act::NewTab) => {
                 self.set_dialog(true);
@@ -2393,6 +2444,7 @@ impl Root {
         let act = match index {
             0 => Act::MenuFile,
             1 => Act::MenuSession,
+            2 => Act::MenuTerminal,
             _ => Act::MenuHelp,
         };
         let active = self.open_menu == Some(index);
@@ -2443,186 +2495,6 @@ impl Root {
                 .view(theme)])
     }
 
-    /// 表单下拉框：与 `TextField` 同高同宽，点击展开 `Menu` 浮层。
-    ///
-    /// 用 `with_slot` 而不是裸 `child_key`：浮层内容的 key 重绑只认具名槽位，
-    /// 否则它会被当成匿名节点、父级无法用对应的 `Act` 认领。
-    fn select_field(
-        &self,
-        theme: &UiTheme,
-        act: Act,
-        options: &[&str],
-        selected: usize,
-        open: bool,
-    ) -> ViewNode {
-        let key = child_key(ROOT_KEY, act.local());
-        let mut style = Style::default();
-        style.layout.direction = FlexDirection::Row;
-        style.layout.align_items = AlignItems::Center;
-        style.layout.justify_content = JustifyContent::SpaceBetween;
-        style.layout.width = Length::px(FIELD_WIDTH);
-        style.layout.height = Length::px(32.0);
-        style.layout.padding = Edges::new(0.0, 10.0, 0.0, 10.0);
-        style.layout.border = Edges::all(1.0);
-        style.visual.corner_radius = Corners::all(3.0);
-        style.visual.background = theme.bg(BgToken::SpecialComponent);
-        style.visual.border_color = if open {
-            theme.brand(Shade::Base)
-        } else {
-            theme.border(BorderToken::Level2)
-        };
-        style.visual.cursor = Cursor::Pointer;
-        if !open {
-            style.visual = style.visual.with_override(
-                InteractionState::Hovered,
-                VisualOverrides {
-                    border_color: Some(theme.brand(Shade::Base)),
-                    ..VisualOverrides::default()
-                },
-            );
-        }
-        let mut arrow = Decl::icon(child_key(ROOT_KEY, 0), zzzui::element::Icon::ChevronDown);
-        if let Decl::Icon { size, .. } = &mut arrow {
-            *size = 12.0;
-        }
-        let mut arrow_style = Style::default();
-        arrow_style.visual.color = theme.text(TextToken::Secondary);
-        let text = options
-            .get(selected.min(options.len().saturating_sub(1)))
-            .copied()
-            .unwrap_or_default();
-        ViewNode::new(Decl::div(key).with_style(style))
-            .with_slot(Some(act.local()))
-            .child(passthrough(Label::new(text).view(theme)))
-            .child(passthrough(ViewNode::new(arrow.with_style(arrow_style))))
-    }
-
-    /// 表单标签：固定宽度 + 右对齐，让各行输入框的起点一致。
-    fn form_label(text: &str, theme: &UiTheme) -> ViewNode {
-        let mut style = Style::default();
-        style.layout.direction = FlexDirection::Row;
-        style.layout.align_items = AlignItems::Center;
-        style.layout.justify_content = JustifyContent::End;
-        style.layout.width = Length::px(LABEL_WIDTH);
-        style.layout.height = Length::px(32.0);
-        ViewNode::new(Decl::div(ROOT_KEY).with_style(style)).child(Label::new(text).view(theme))
-    }
-
-    fn dialog(&self, owner: NodeKey, theme: &UiTheme, shared: &Shared) -> OverlayView {
-        let mut body = vec![
-            Tabs::new(["本地终端", "SSH"])
-                .selected(self.tab)
-                .with_key(Act::Tabs)
-                .view(theme),
-        ];
-
-        if self.tab == 0 {
-            let shells: Vec<&str> = self.shells.iter().map(|(name, _)| name.as_str()).collect();
-            // Column 默认交叉轴拉伸，必须显式限宽，Center 才有居中效果。
-            let form = Column::new()
-                .gap(8.0)
-                .width(FIELD_WIDTH)
-                .view(theme)
-                .with_children([
-                    Label::new("本地 Shell").view(theme),
-                    self.select_field(theme, Act::Shell, &shells, self.shell, self.shell_open),
-                ]);
-            body.push(Center::new().view(theme).with_children([form]));
-        } else {
-            let mut ssh_fields = vec![
-                Row::new().gap(8.0).view(theme).with_children([
-                    Self::form_label("主机", theme),
-                    TextField::new(self.host.clone())
-                        .width(FIELD_WIDTH)
-                        .with_key(Act::Host)
-                        .view(theme),
-                ]),
-                Row::new().gap(8.0).view(theme).with_children([
-                    Self::form_label("端口", theme),
-                    TextField::new(self.port.clone())
-                        .width(FIELD_WIDTH)
-                        .with_key(Act::Port)
-                        .view(theme),
-                ]),
-                Row::new().gap(8.0).view(theme).with_children([
-                    Self::form_label("用户", theme),
-                    TextField::new(self.user.clone())
-                        .width(FIELD_WIDTH)
-                        .with_key(Act::User)
-                        .view(theme),
-                ]),
-                // 认证方式用下拉选择，后面的字段随选择切换：只展示当前方式需要的属性。
-                Row::new().gap(8.0).view(theme).with_children([
-                    Self::form_label("认证方式", theme),
-                    self.select_field(
-                        theme,
-                        Act::AuthMode,
-                        AUTH_OPTIONS,
-                        self.auth,
-                        self.auth_open,
-                    ),
-                ]),
-            ];
-            if self.auth == 0 {
-                ssh_fields.push(
-                    Row::new().gap(8.0).view(theme).with_children([
-                        Self::form_label("密码", theme),
-                        TextField::new(self.password.clone())
-                            .width(FIELD_WIDTH)
-                            .password(true)
-                            .with_key(Act::Password)
-                            .view(theme),
-                    ]),
-                );
-            } else {
-                ssh_fields.push(
-                    Row::new().gap(8.0).view(theme).with_children([
-                        Self::form_label("密钥", theme),
-                        TextField::new(self.identity.clone())
-                            .width(FIELD_WIDTH)
-                            .with_key(Act::Identity)
-                            .view(theme),
-                    ]),
-                );
-                ssh_fields.push(
-                    Row::new().gap(8.0).view(theme).with_children([
-                        Self::form_label("", theme),
-                        Label::new("留空则自动尝试默认密钥或 ssh config")
-                            .size(12.0)
-                            .color(theme.text(TextToken::Secondary))
-                            .view(theme),
-                    ]),
-                );
-            }
-            // 标签列 + 间距 + 字段：固定宽度后由外层 Center 水平居中。
-            let form = Column::new()
-                .gap(8.0)
-                .width(LABEL_WIDTH + 8.0 + FIELD_WIDTH)
-                .view(theme)
-                .with_children(ssh_fields);
-            body.push(Center::new().view(theme).with_children([form]));
-        }
-
-        // 连接失败后对话框重新打开，空页上的提示会被遮罩盖住：把原因放进对话框。
-        if shared.screen == Screen::Failed && !shared.label.is_empty() {
-            body.push(
-                Label::new(shared.label.clone())
-                    .size(12.0)
-                    .color(theme.functional(Family::Error, Shade::Base))
-                    .view(theme),
-            );
-        }
-
-        Dialog::new("新建连接")
-            .key(child_key(owner, DIALOG_SLOT))
-            .width(520.0)
-            .content(Column::new().gap(12.0).view(theme).with_children(body))
-            .actions([
-                Button::new("取消").with_key(Act::Cancel).view(theme),
-                Button::new("连接").with_key(Act::Connect).view(theme),
-            ])
-            .build(owner, theme)
-    }
 
     /// rz 上传：远端请求接收文件时让用户填写本地路径。
     fn upload_dialog(
@@ -2752,6 +2624,7 @@ fn menu_title_key(owner: NodeKey, index: usize) -> NodeKey {
     let act = match index {
         0 => Act::MenuFile,
         1 => Act::MenuSession,
+        2 => Act::MenuTerminal,
         _ => Act::MenuHelp,
     };
     child_key(owner, act.local())
@@ -3328,6 +3201,7 @@ impl AppHandler for LietermApp {
         let root = Root {
             shared: Arc::clone(&self.shared),
             actions: self.actions_tx.clone(),
+            form_snapshot: Arc::new(Mutex::new(ConnectForm::default())),
             host: String::new(),
             port: "22".to_owned(),
             user: String::new(),

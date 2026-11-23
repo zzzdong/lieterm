@@ -15,6 +15,7 @@ fn root_with(screen: Screen, status: &str, dialog: bool) -> Root {
     Root {
         shared,
         actions,
+        form_snapshot: Arc::new(Mutex::new(ConnectForm::default())),
         host: String::new(),
         port: "22".to_owned(),
         user: String::new(),
@@ -48,6 +49,13 @@ fn root_with(screen: Screen, status: &str, dialog: bool) -> Root {
         tab_menu: None,
         selecting: false,
     }
+}
+
+/// 把 Root 挂进真实的 Widget 树，收集主树 + 子组件浮层。
+fn mounted_view(root: Root) -> zzzui::view::ViewTree {
+    let mut app = zzzui::widget::App::new();
+    app.mount(root);
+    app.take_view().expect("首帧必须产出声明树")
 }
 
 fn has_passive(view: &ViewNode) -> bool {
@@ -183,13 +191,17 @@ fn idle_view_prompts_for_a_new_connection() {
 
 #[test]
 fn dialog_is_modal_and_offers_local_and_ssh_tabs() {
-    let root = root_with(Screen::Idle, "", true);
-    let overlays = root.overlays(7, &UiTheme::default());
-    assert_eq!(overlays.len(), 1, "启动时对话框打开");
-    assert!(overlays[0].spec.is_modal(), "对话框是模态的");
-    assert!(has_text(&overlays[0].content, "本地终端"));
-    assert!(has_text(&overlays[0].content, "SSH"));
-    assert!(has_text(&overlays[0].content, "连接"));
+    // 对话框由 ConnectHost 子组件声明，必须挂进完整 Widget 树才能收集到。
+    let tree = mounted_view(root_with(Screen::Idle, "", true));
+    let dialog = tree
+        .overlays
+        .iter()
+        .find(|overlay| has_text(&overlay.content, "新建连接"))
+        .expect("启动时对话框打开");
+    assert!(dialog.spec.is_modal(), "对话框是模态的");
+    assert!(has_text(&dialog.content, "本地终端"));
+    assert!(has_text(&dialog.content, "SSH"));
+    assert!(has_text(&dialog.content, "连接"));
 }
 
 #[test]
@@ -321,5 +333,64 @@ fn geometry_hittest_excludes_the_sidebars() {
     assert!(
         !geom.contains(QUICK_WIDTH + 1.0, geom.bottom + 1.0),
         "状态栏不属于终端"
+    );
+}
+
+#[test]
+fn clicking_ssh_tab_switches_without_connecting_a_local_shell() {
+    fn has_key(node: &ViewNode, key: NodeKey) -> bool {
+        node.decl.key() == key || node.children.iter().any(|child| has_key(child, key))
+    }
+
+    let tree = mounted_view(root_with(Screen::Idle, "", true));
+    let dialog = tree
+        .overlays
+        .iter()
+        .find(|overlay| has_text(&overlay.content, "新建连接"))
+        .expect("对话框由 ConnectHost 声明");
+    // 找到「SSH」文本所在行的 key：SlotScope::Control 让它相对 Tabs 根派生，
+    // 不与宿主的 Act::Connect 撞车。
+    fn ssh_row_key(node: &ViewNode) -> Option<NodeKey> {
+        let is_ssh = match &node.decl {
+            zzzui::element::Decl::Text { content, .. } => content.as_ref() == "SSH",
+            _ => false,
+        };
+        if is_ssh {
+            return Some(node.decl.key());
+        }
+        node.children.iter().find_map(ssh_row_key)
+    }
+    let ssh_text_key = ssh_row_key(&dialog.content).expect("SSH 标签文本应在声明树里");
+    assert_ne!(ssh_text_key, child_key(dialog.owner, Act::Connect.local()));
+
+    // 点击由 ConnectHost 认领，并上报 Choice{Tabs,1} 给 Root。
+    let root = root_with(Screen::Idle, "", true);
+    let form_snapshot = Arc::clone(&root.form_snapshot);
+    let shared = Arc::clone(&root.shared);
+    let click = RawCommand::Click {
+        target: zzzui::element::WidgetId::null(),
+        key: Some(ssh_text_key),
+    };
+    let mut host = crate::connect_host::ConnectHost::new(form_snapshot);
+    let mut host_ctx = UpdateCtx::test();
+    assert!(host.on_command(dialog.owner, &click, &mut host_ctx), "子组件认领标签点击");
+
+    // Root 认领事件后切换标签，且不得触发连接。
+    let choice = zzzui::element::CustomEvent::new(crate::connect_host::Choice {
+        act: Act::Tabs,
+        index: 1,
+    });
+    let emit = RawCommand::Emit {
+        target: zzzui::element::WidgetId::null(),
+        event: choice,
+    };
+    let mut root = root_with(Screen::Idle, "", true);
+    let mut ctx = UpdateCtx::test();
+    assert!(root.on_command(7, &emit, &mut ctx));
+    assert_eq!(root.tab, 1, "点 SSH 应切换标签");
+    assert_eq!(
+        shared.lock().expect("shared lock").screen,
+        Screen::Idle,
+        "切换标签不得触发连接"
     );
 }

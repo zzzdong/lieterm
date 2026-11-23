@@ -1,4 +1,5 @@
 mod app;
+mod connect_host;
 mod config;
 mod keys;
 mod known_hosts;
